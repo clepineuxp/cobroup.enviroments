@@ -1,5 +1,8 @@
 # COBROUP - Entornos y Manifiestos de Kubernetes (GitOps)
 
+> **Repositorio Oficial:** [https://github.com/clepineuxp/cobroup.enviroments.git](https://github.com/clepineuxp/cobroup.enviroments.git)  
+> **Arquitectura:** GitOps declarativo con Kustomize, K3s, Ingress-NGINX y sustitución segura de secretos.
+
 Este repositorio contiene las plantillas declarativas de Kubernetes (K3s), archivos Kustomize, Ingress y definiciones de secretos para los ambientes de **Desarrollo (dev)**, **Pruebas (qa)** y **Producción (prod)** de la plataforma **COBROUP**.
 
 ---
@@ -45,12 +48,12 @@ Las imágenes de contenedor se construyen y publican en **GitHub Container Regis
 ## 3. Estructura del Directorio
 
 ```text
-cobroup.environments/
+cobroup.enviroments/
 ├── .github/
 │   └── workflows/
-│       ├── deploy-dev.yml              # Exporta manifiestos dev renderizados a /opt/cobroup/deploys/dev
-│       ├── deploy-qa.yml               # Exporta manifiestos qa renderizados a /opt/cobroup/deploys/qa
-│       └── deploy-prod.yml             # Exporta manifiestos prod renderizados a /opt/cobroup/deploys/prod
+│       ├── deploy-dev.yml              # Exporta manifiestos dev y bootstrap a /opt/cobroup/deploys/dev
+│       ├── deploy-qa.yml               # Exporta manifiestos qa y bootstrap a /opt/cobroup/deploys/qa
+│       └── deploy-prod.yml             # Exporta manifiestos prod y bootstrap a /opt/cobroup/deploys/prod
 ├── bootstrap/
 │   └── cobroup-infra-bootstrap.yaml    # Namespaces cobroup-dev, cobroup-qa, cobroup-prod
 ├── dev/
@@ -73,17 +76,49 @@ cobroup.environments/
 
 ---
 
-## 4. Guía de Despliegue en VPS
+## 4. Configuración Requerida en GitHub
+
+### Paso 1: Subir las Ramas Iniciales
+```bash
+git push -u origin main
+git push -u origin dev
+git push -u origin qa
+```
+
+### Paso 2: Crear el Entorno `cobroup`
+En **Settings ➔ Environments ➔ New environment**: crear el entorno `cobroup`.
+
+### Paso 3: Cargar Secretos (Secrets)
+En **Settings ➔ Secrets and variables ➔ Actions**:
+- `SSH_HOST`: IP pública de la VPS.
+- `SSH_USER`: `deployer`.
+- `SSH_KEY`: Clave privada SSH Ed25519.
+- `SSH_PORT`: `22`.
+- `GHCR_TOKEN`: PAT clásico de GitHub con scope `read:packages`.
+- `DEV_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en dev.
+- `DEV_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en dev.
+- `DEV_JWT_SECRET`: Clave simétrica secreta JWT en dev.
+- `QA_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en qa.
+- `QA_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en qa.
+- `QA_JWT_SECRET`: Clave simétrica secreta JWT en qa.
+- `PROD_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en prod.
+- `PROD_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en prod.
+- `PROD_JWT_SECRET`: Clave simétrica secreta JWT en prod.
+
+### Paso 4: Cargar Variables
+- `GHCR_USERNAME`: `clepineuxp`.
+
+---
+
+## 5. Guía de Despliegue en VPS
 
 ### Paso 1: Bootstrap de Infraestructura (Namespaces)
 
 ```bash
-kubectl apply -f bootstrap/cobroup-infra-bootstrap.yaml
+kubectl apply -f /opt/cobroup/deploys/bootstrap/cobroup-infra-bootstrap.yaml
 ```
 
 ### Paso 2: Autenticación con GitHub Container Registry (GHCR)
-
-En cada namespace (`cobroup-dev`, `cobroup-qa`, `cobroup-prod`), crear el secreto Docker para descargar imágenes privadas:
 
 ```bash
 # Para DEV
@@ -108,21 +143,17 @@ kubectl create secret docker-registry ghcr-secret \
   --namespace=cobroup-prod
 ```
 
-> **Nota**: El token personal (PAT) de GitHub requiere el scope `read:packages`.
-
 ### Paso 3: Despliegue Completo con Kustomize
-
-Para desplegar un ambiente de forma atómica y completa en K3s:
 
 ```bash
 # Desplegar ambiente DEV
-kubectl apply -k ./dev
+kubectl apply -k /opt/cobroup/deploys/dev
 
 # Desplegar ambiente QA
-kubectl apply -k ./qa
+kubectl apply -k /opt/cobroup/deploys/qa
 
 # Desplegar ambiente PROD
-kubectl apply -k ./prod
+kubectl apply -k /opt/cobroup/deploys/prod
 ```
 
 ### Paso 4: Verificación del Estado
@@ -140,12 +171,12 @@ kubectl get ingress -n cobroup-dev
 
 ---
 
-## 5. Flujo GitOps y Despliegue Continuo (CI/CD)
+## 6. Flujo GitOps y Despliegue Continuo (CI/CD)
 
 1. **Gestión de Manifiestos**:
-   Al realizar push a las ramas `dev`, `qa` o `main`/`prod` de este repositorio `cobroup.environments`, el workflow de GitHub Actions:
+   Al realizar push a las ramas `dev`, `qa` o `main`/`prod` de este repositorio `cobroup.enviroments`, el workflow de GitHub Actions:
    - Sustituye los placeholders de conexión (`${{Dev_OperationsDatabase__ConnectionString}}`, etc.) con los secrets de GitHub.
-   - Copia mediante SCP los manifiestos renderizados al directorio `/opt/cobroup/deploys/<ambiente>` en la VPS.
+   - Copia mediante SCP los manifiestos renderizados al directorio `/opt/cobroup/deploys/<ambiente>` y el bootstrap a `/opt/cobroup/deploys/bootstrap` en la VPS.
 2. **Despliegue de Código**:
    Al realizar push en los repositorios de microservicios (`MS.Cobroup.Backend`, `MS.Cobroup.BackendAdmin`, `MF.cobroup-frontend`, `MF.cobroup-frontend-admin`), su GitHub Action:
    - Ejecuta las pruebas automatizadas (gate de calidad).
