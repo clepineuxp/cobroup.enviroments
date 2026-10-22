@@ -1,0 +1,100 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cobroup-ingress
+  namespace: cobroup-qa
+  labels:
+    app.kubernetes.io/part-of: cobroup
+    environment: qa
+  annotations:
+    ingress.class: nginx
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - qa.cobroup.com
+        - qa-admin.cobroup.com
+        - qa-api.cobroup.com
+        - qa-auth.cobroup.com
+      secretName: cobroup-tls
+  rules:
+    # 1. PWA Recolector (Collector Frontend)
+    - host: qa.cobroup.com
+      http:
+        paths:
+          - path: /api/operations
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+          - path: /identity
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-backend
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 8080
+
+    # 2. Portal Administrativo (Admin Frontend)
+    - host: qa-admin.cobroup.com
+      http:
+        paths:
+          - path: /api/operations
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+          - path: /identity
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-backend
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-frontend
+                port:
+                  number: 8080
+
+    # 3. Dedicated Operations API Domain
+    - host: qa-api.cobroup.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+
+    # 4. Dedicated Auth / Identity Domain (OpenIddict)
+    - host: qa-auth.cobroup.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin-backend
+                port:
+                  number: 8080

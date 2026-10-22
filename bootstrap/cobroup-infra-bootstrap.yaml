@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cobroup-dev
+  labels:
+    app.kubernetes.io/part-of: cobroup
+    environment: dev
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cobroup-qa
+  labels:
+    app.kubernetes.io/part-of: cobroup
+    environment: qa
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cobroup-prod
+  labels:
+    app.kubernetes.io/part-of: cobroup
+    environment: prod

@@ -1,0 +1,107 @@
+name: Export Dev Manifests via SSH
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'dev/**'
+      - '.github/workflows/deploy-dev.yml'
+  workflow_dispatch:
+
+jobs:
+  export-to-server:
+    name: Export Dev Manifests to Remote Server
+    runs-on: ubuntu-latest
+    environment: cobroup
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Set up Python for Variable Substitution
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: 3. Replace Environment Placeholders in dev/ Manifests
+        env:
+          DEV_OPERATIONSDATABASE_CONNECTIONSTRING: ${{ vars.DEV_OPERATIONSDATABASE_CONNECTIONSTRING || secrets.DEV_OPERATIONSDATABASE_CONNECTIONSTRING }}
+          DEV_IDENTITYDATABASE_CONNECTIONSTRING: ${{ vars.DEV_IDENTITYDATABASE_CONNECTIONSTRING || secrets.DEV_IDENTITYDATABASE_CONNECTIONSTRING }}
+          DEV_JWT_SECRET: ${{ vars.DEV_JWT_SECRET || secrets.DEV_JWT_SECRET }}
+          GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import os, base64
+
+          P = "${" + "{"
+          S = "}}"
+
+          replacements = {
+              f"{P}Dev_OperationsDatabase__ConnectionString{S}": os.environ.get("DEV_OPERATIONSDATABASE_CONNECTIONSTRING", ""),
+              f"{P}Dev_IdentityDatabase__ConnectionString{S}": os.environ.get("DEV_IDENTITYDATABASE_CONNECTIONSTRING", ""),
+              f"{P}Dev_Jwt__Secret{S}": os.environ.get("DEV_JWT_SECRET", ""),
+          }
+
+          # Scan all yaml/yml files in dev directory
+          for root, dirs, files in os.walk("dev"):
+              for file in files:
+                  if file.endswith((".yaml", ".yml")):
+                      filepath = os.path.join(root, file)
+                      with open(filepath, "r", encoding="utf-8") as f:
+                          content = f.read()
+
+                      modified = content
+                      for placeholder, value in replacements.items():
+                          if value and placeholder in modified:
+                              modified = modified.replace(placeholder, value)
+                              print(f"Replaced {placeholder} in {filepath}")
+
+                      # Also substitute ghcr credentials if available
+                      ghcr_user = os.environ.get("GHCR_USERNAME")
+                      ghcr_token = os.environ.get("GHCR_TOKEN")
+                      if ghcr_user and ghcr_token and file == "ghcr-secret.yaml":
+                          auth_b64 = base64.b64encode(f"{ghcr_user}:{ghcr_token}".encode("utf-8")).decode("utf-8")
+                          modified = modified.replace("CHANGE_ME_GITHUB_USER", ghcr_user)
+                          modified = modified.replace("CHANGE_ME_GITHUB_PAT", ghcr_token)
+                          modified = modified.replace("CHANGE_ME", auth_b64)
+                          print(f"Injected GHCR credentials in {filepath}")
+
+                      if modified != content:
+                          with open(filepath, "w", encoding="utf-8") as f:
+                              f.write(modified)
+          EOF
+
+      - name: 4. Ensure Target Directory on Remote Server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            mkdir -p /opt/cobroup/deploys/dev
+
+      - name: 5. Copy Manifests to /opt/cobroup/deploys/dev via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "dev/*"
+          target: "/opt/cobroup/deploys/dev"
+          strip_components: 1
+          overwrite: true
+
+      - name: 6. Verify Files on Remote Server
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            echo "Manifests successfully exported to /opt/cobroup/deploys/dev:"
+            ls -la /opt/cobroup/deploys/dev
