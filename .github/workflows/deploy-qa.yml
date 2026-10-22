@@ -6,6 +6,7 @@ on:
       - qa
     paths:
       - 'qa/**'
+      - 'bootstrap/**'
       - '.github/workflows/deploy-qa.yml'
   workflow_dispatch:
 
@@ -73,7 +74,7 @@ jobs:
                               f.write(modified)
           EOF
 
-      - name: 4. Ensure Target Directory on Remote Server
+      - name: 4. Ensure Target Directories on Remote Server
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -82,8 +83,9 @@ jobs:
           port: ${{ secrets.SSH_PORT || 22 }}
           script: |
             mkdir -p /opt/cobroup/deploys/qa
+            mkdir -p /opt/cobroup/deploys/bootstrap
 
-      - name: 5. Copy Manifests to /opt/cobroup/deploys/qa via SCP
+      - name: 5. Copy QA Manifests to /opt/cobroup/deploys/qa via SCP
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -95,7 +97,19 @@ jobs:
           strip_components: 1
           overwrite: true
 
-      - name: 6. Verify Files on Remote Server
+      - name: 6. Copy Bootstrap Manifests to /opt/cobroup/deploys/bootstrap via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "bootstrap/*"
+          target: "/opt/cobroup/deploys/bootstrap"
+          strip_components: 1
+          overwrite: true
+
+      - name: 7. Verify Files on Remote Server
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
