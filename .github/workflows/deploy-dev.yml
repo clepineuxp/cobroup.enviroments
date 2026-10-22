@@ -29,12 +29,13 @@ jobs:
         env:
           DEV_OPERATIONSDATABASE_CONNECTIONSTRING: ${{ vars.DEV_OPERATIONSDATABASE_CONNECTIONSTRING || secrets.DEV_OPERATIONSDATABASE_CONNECTIONSTRING }}
           DEV_IDENTITYDATABASE_CONNECTIONSTRING: ${{ vars.DEV_IDENTITYDATABASE_CONNECTIONSTRING || secrets.DEV_IDENTITYDATABASE_CONNECTIONSTRING }}
-          DEV_JWT_SECRET: ${{ vars.DEV_JWT_SECRET || secrets.DEV_JWT_SECRET }}
+          DEV_JWT_KEY_ID: ${{ vars.DEV_JWT_KEY_ID || 'cobroup-dev-key-1' }}
+          DEV_JWT_PRIVATE_KEY_PEM: ${{ secrets.DEV_JWT_PRIVATE_KEY_PEM }}
           GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           python3 - << 'EOF'
-          import os, base64
+          import os, base64, sys
 
           P = "${" + "{"
           S = "}}"
@@ -42,8 +43,11 @@ jobs:
           replacements = {
               f"{P}Dev_OperationsDatabase__ConnectionString{S}": os.environ.get("DEV_OPERATIONSDATABASE_CONNECTIONSTRING", ""),
               f"{P}Dev_IdentityDatabase__ConnectionString{S}": os.environ.get("DEV_IDENTITYDATABASE_CONNECTIONSTRING", ""),
-              f"{P}Dev_Jwt__Secret{S}": os.environ.get("DEV_JWT_SECRET", ""),
+              f"{P}Dev_Jwt__KeyId{S}": os.environ.get("DEV_JWT_KEY_ID", ""),
+              f"{P}Dev_Jwt__PrivateKeyPem{S}": os.environ.get("DEV_JWT_PRIVATE_KEY_PEM", ""),
           }
+
+          unresolved = []
 
           # Scan all yaml/yml files in dev directory
           for root, dirs, files in os.walk("dev"):
@@ -72,6 +76,12 @@ jobs:
                       if modified != content:
                           with open(filepath, "w", encoding="utf-8") as f:
                               f.write(modified)
+
+                      if "Jwt__" in modified and P in modified:
+                          unresolved.append(filepath)
+
+          if unresolved:
+              sys.exit(f"Deployment failed: Unresolved JWT placeholders in {unresolved}")
           EOF
 
       - name: 4. Ensure Target Directories on Remote Server

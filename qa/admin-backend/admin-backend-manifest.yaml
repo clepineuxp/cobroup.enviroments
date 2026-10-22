@@ -12,6 +12,7 @@ data:
   ASPNETCORE_URLS: "http://+:8080"
   DOTNET_RUNNING_IN_CONTAINER: "true"
   Identity__Issuer: "https://qa-auth.cobroup.com"
+  Identity__Audience: "cobroup-api"
   OperationalApi__BaseUrl: "http://backend:8080"
   Logging__LogLevel__Default: "Information"
   Logging__LogLevel__Microsoft.AspNetCore: "Warning"

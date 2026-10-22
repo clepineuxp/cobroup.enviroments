@@ -12,6 +12,8 @@ data:
   ASPNETCORE_URLS: "http://+:8080"
   DOTNET_RUNNING_IN_CONTAINER: "true"
   Identity__Issuer: "https://qa-auth.cobroup.com"
+  Identity__Audience: "cobroup-api"
+  Identity__JwksUri: "http://admin-backend:8080/api/v1/auth/.well-known/jwks.json"
   AdministrativeApi__BaseUrl: "http://admin-backend:8080"
   Logging__LogLevel__Default: "Information"
   Logging__LogLevel__Microsoft.AspNetCore: "Warning"
