@@ -40,14 +40,28 @@ jobs:
           P = "${" + "{"
           S = "}}"
 
+          raw_pem = os.environ.get("DEV_JWT_PRIVATE_KEY_PEM", "").strip()
+          if raw_pem:
+              if raw_pem.startswith("LS0t") or (" " not in raw_pem and "-----" not in raw_pem):
+                  try:
+                      decoded = base64.b64decode(raw_pem).decode("utf-8")
+                      if "-----BEGIN" in decoded:
+                          raw_pem = decoded.strip()
+                  except Exception:
+                      pass
+              formatted_pem = "\n    ".join(line.strip() for line in raw_pem.splitlines() if line.strip())
+          else:
+              formatted_pem = ""
+
           replacements = {
               f"{P}Dev_OperationsDatabase__ConnectionString{S}": os.environ.get("DEV_OPERATIONSDATABASE_CONNECTIONSTRING", ""),
               f"{P}Dev_IdentityDatabase__ConnectionString{S}": os.environ.get("DEV_IDENTITYDATABASE_CONNECTIONSTRING", ""),
               f"{P}Dev_Jwt__KeyId{S}": os.environ.get("DEV_JWT_KEY_ID", ""),
-              f"{P}Dev_Jwt__PrivateKeyPem{S}": os.environ.get("DEV_JWT_PRIVATE_KEY_PEM", ""),
+              f"{P}Dev_Jwt__PrivateKeyPem{S}": formatted_pem,
           }
 
           unresolved = []
+          modified_files = []
 
           # Scan all yaml/yml files in dev directory
           for root, dirs, files in os.walk("dev"):
@@ -76,12 +90,22 @@ jobs:
                       if modified != content:
                           with open(filepath, "w", encoding="utf-8") as f:
                               f.write(modified)
+                          modified_files.append(filepath)
 
                       if "Jwt__" in modified and P in modified:
                           unresolved.append(filepath)
 
           if unresolved:
               sys.exit(f"Deployment failed: Unresolved JWT placeholders in {unresolved}")
+
+          for filepath in modified_files:
+              try:
+                  import yaml
+                  with open(filepath, "r", encoding="utf-8") as f:
+                      list(yaml.safe_load_all(f))
+                  print(f"Validated syntax for {filepath}")
+              except Exception as e:
+                  sys.exit(f"Deployment failed: YAML syntax error in {filepath}: {e}")
           EOF
 
       - name: 4. Ensure Target Directories on Remote Server
