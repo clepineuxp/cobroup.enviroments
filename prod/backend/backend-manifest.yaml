@@ -15,8 +15,26 @@ data:
   Identity__Audience: "cobroup-api"
   Identity__JwksUri: "http://admin-backend:8080/api/v1/auth/.well-known/jwks.json"
   AdministrativeApi__BaseUrl: "http://admin-backend:8080"
+  Storage__Provider: "FileSystem"
+  Storage__EvidencePath: "/var/cobroup/evidences"
   Logging__LogLevel__Default: "Information"
   Logging__LogLevel__Microsoft.AspNetCore: "Warning"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backend-evidence-pvc
+  namespace: cobroup-prod
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: cobroup
+    environment: prod
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -46,6 +64,9 @@ spec:
         app.kubernetes.io/part-of: cobroup
         environment: prod
     spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
       imagePullSecrets:
         - name: ghcr-secret
       containers:
@@ -61,6 +82,9 @@ spec:
                 name: backend-config
             - secretRef:
                 name: backend-secret
+          volumeMounts:
+            - name: backend-evidence-volume
+              mountPath: /var/cobroup/evidences
           resources:
             requests:
               cpu: 100m
@@ -84,6 +108,10 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 2
+      volumes:
+        - name: backend-evidence-volume
+          persistentVolumeClaim:
+            claimName: backend-evidence-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -98,8 +126,6 @@ spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: backend
-    app.kubernetes.io/part-of: cobroup
-    environment: prod
   ports:
     - name: http
       port: 8080

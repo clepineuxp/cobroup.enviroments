@@ -1,0 +1,81 @@
+# cobroup.environments — Registro Operativo de Agentes de IA
+
+Este documento registra cronológicamente las intervenciones y decisiones realizadas por agentes en el repositorio `cobroup.environments`. Cada entrada es estrictamente append-only.
+
+## Entradas cronológicas
+
+### 2026-10-22 — Remediación Bloqueantes B-09 y B-13 (Auditoría v5): Almacenamiento PVC y Renderer Reproducible de Manifiestos
+
+- **Solicitud**: Remediar los bloqueantes B-09 (almacenamiento durable en PVC) y B-13 (workflow de manifiestos con PyYAML faltante y script inline duplicado), documentados en la auditoría v5 (`cobroup.md/informe/auditoria-backend-csharp-2026-10-22-v5.html`).
+- **Decisión de almacenamiento PVC→S3**:
+  - Proveedor actual: PersistentVolumeClaim de Kubernetes montado en `/var/cobroup/evidences`. En producción (2 réplicas) requiere `ReadWriteMany` (10Gi).
+  - Proveedor futuro previsto: AWS S3 por inyección de dependencias y configuración sin alterar los contratos HTTP ni la lógica de negocio.
+- **Implementación técnica**:
+  - **B-09 (Manifiestos Kubernetes)**:
+    - `dev/backend/backend-manifest.yaml`: PVC `backend-evidences-pvc` (1Gi, `ReadWriteOnce`), volumen montado en `/var/cobroup/evidences`, variables `Storage__Provider: "FileSystem"` y `Storage__EvidencePath: "/var/cobroup/evidences"`, `securityContext` del contenedor con `fsGroup: 1000` y `runAsUser: 1000`.
+    - `qa/backend/backend-manifest.yaml`: PVC `backend-evidences-pvc` (5Gi, `ReadWriteOnce`), volumen y variables homólogas.
+    - `prod/backend/backend-manifest.yaml`: PVC `backend-evidences-pvc` (10Gi, `ReadWriteMany` para soporte de 2 réplicas concurrentes), volumen y variables homólogas.
+    - Documentación en `README.md` con matriz de almacenamiento y requerimientos de StorageClass.
+  - **B-13 (Pipeline CI/CD y Renderizado Reproducible)**:
+    - `scripts/requirements.txt`: Declaración explícita de `PyYAML==6.0.2`.
+    - `scripts/render_manifests.py`: Script modular y reutilizable para sustitución de variables y secretos PEM (formato multilínea o base64 en bloque literal YAML `|`), validación de variables requeridas, detección de placeholders no resueltos, validación sintáctica de todos los YAML con `yaml.safe_load_all`, validación estructural de Kubernetes (Deployment, PVC, Mount, Variables de Storage con exigencia de `ReadWriteMany` en producción) y validación post-render mediante `kubectl kustomize`. No imprime secretos en salida ni logs.
+    - `.github/workflows/deploy-dev.yml`, `deploy-qa.yml`, `deploy-prod.yml`: Actualizados para instalar dependencias desde `scripts/requirements.txt` y ejecutar `python scripts/render_manifests.py --env <dev|qa|prod>` antes de cualquier transferencia remota por SCP/SSH.
+    - `scripts/test_render_manifests.py`: Suite de 7 pruebas unitarias y de integración que validan el comportamiento con PEM multilínea, base64, fallos por variables vacías, YAML inválido, almacenamiento incorrecto y render completo con `kubectl kustomize`.
+- **Archivos modificados/creados**:
+  - Modificados: `dev/backend/backend-manifest.yaml`, `qa/backend/backend-manifest.yaml`, `prod/backend/backend-manifest.yaml`, `.github/workflows/deploy-dev.yml`, `.github/workflows/deploy-qa.yml`, `.github/workflows/deploy-prod.yml`, `README.md`.
+  - Creados: `scripts/requirements.txt`, `scripts/render_manifests.py`, `scripts/test_render_manifests.py`, `AGENTS.md`.
+- **Resultados de pruebas**:
+  - 7/7 pruebas unitarias e integración en verde en `test_render_manifests.py`:
+    - `test_missing_pyyaml_guidance_error`: Demuestra detección limpia si faltara la dependencia.
+    - `test_valid_render_dev`: Renderiza dev completo y ejecuta `kubectl kustomize dev` exitosamente.
+    - `test_valid_render_qa`: Renderiza qa completo y ejecuta `kubectl kustomize qa` exitosamente.
+    - `test_valid_render_prod`: Renderiza prod completo, valida PVC `ReadWriteMany` y ejecuta `kubectl kustomize prod` exitosamente.
+    - `test_render_fails_on_empty_secret`: Detiene el pipeline antes del despliegue si falta un secreto obligatorio.
+    - `test_render_fails_on_malformed_yaml`: Detiene el pipeline ante YAML sintácticamente inválido.
+    - `test_render_fails_when_prod_pvc_not_rwx`: Detiene el pipeline si el PVC de producción no especifica `ReadWriteMany`.
+  - Validación post-render de `kubectl kustomize` ejecutada en dev, qa y prod con 0 errores.
+- **Git**: Cambios preservados en working tree sobre rama `dev`; sin commit, push, merge, tag ni PR.
+
+### 2026-10-22 — Decisión arquitectónica: Retiro de PEM del flujo activo, configuración de RSA efímero en Dev y Gate de despliegue en CI/CD
+
+- **Rama de trabajo**: Creada y cambiada a `feature/diferir-pem-rsa-efimero` a partir de `dev` bajo autorización explícita del usuario.
+- **Decisión obligatoria aplicada**:
+  > COBROUP continuará usando JWT firmados. En la fase actual de desarrollo y validación no se configurará una clave privada externa en formato PEM. BackendAdmin utilizará un proveedor RSA efímero generado en memoria, habilitado de forma explícita y restringido a entornos no productivos. La clave y el `kid` cambian al reiniciar la instancia; en consecuencia, los JWT emitidos antes del reinicio pueden dejar de ser válidos. Este modo no se considera apto para producción, alta disponibilidad ni múltiples réplicas emisoras. La custodia de una clave persistente, su rotación, solapamiento de claves y recuperación operativa mediante Kubernetes Secret, PFX, PEM, AWS KMS u otro proveedor aprobado quedan registrados como backlog obligatorio previo a producción.
+- **Modificaciones técnicas**:
+  - **Secretos retirados**: `dev/admin-backend/secret.yaml`, `qa/admin-backend/secret.yaml` y `prod/admin-backend/secret.yaml` retiraron los placeholders `Jwt__KeyId` y `Jwt__PrivateKeyPem`, manteniendo únicamente `ConnectionStrings__IdentityDatabase`.
+  - **ConfigMap Dev**: `dev/admin-backend/admin-backend-manifest.yaml` configurado con `Jwt__SigningProvider: "EphemeralRsa"` y `Jwt__AllowEphemeralSigning: "true"`.
+  - **ConfigMap QA y Prod**: `qa/admin-backend/admin-backend-manifest.yaml` y `prod/admin-backend/admin-backend-manifest.yaml` configurados con `Jwt__SigningProvider: "PersistentRsa"`.
+  - **Workflows GitHub Actions**: `.github/workflows/deploy-dev.yml`, `deploy-qa.yml` y `deploy-prod.yml` eliminaron las variables `*_JWT_KEY_ID` y `*_JWT_PRIVATE_KEY_PEM`.
+  - **Renderer reproducible (`scripts/render_manifests.py`)**:
+    - Eliminada la normalización y sustitución de claves PEM privadas.
+    - Valida que `dev` use `EphemeralRsa` con `AllowEphemeralSigning=true`.
+    - Bloquea explícitamente `EphemeralRsa` en QA y Prod.
+    - Implementa gate de despliegue: detiene el pipeline con código de salida 2 antes de la transferencia SCP para QA y Prod mientras el proveedor persistente esté en backlog.
+    - Agregado flag `--render-only` para validación local y pruebas.
+    - Conserva validación integral de YAML, placeholders no resueltos, estructura PVC (`ReadWriteMany` en producción) y ejecución de `kubectl kustomize`.
+- **Pruebas automatizadas**:
+  - `scripts/test_render_manifests.py`: 9/9 pruebas en verde:
+    1. `test_missing_pyyaml_guidance_error`: Detección clara de ausencia de PyYAML.
+    2. `test_valid_render_dev`: Renderizado dev completo con `EphemeralRsa` y ejecución exitosa de `kubectl kustomize dev`.
+    3. `test_qa_fails_with_ephemeral_rsa`: Rechazo estricto de proveedor efímero en QA.
+    4. `test_qa_blocks_deployment_gate_for_backlog`: Gate detiene despliegue en QA con código 2 por backlog de proveedor persistente.
+    5. `test_prod_blocks_deployment_gate_for_backlog`: Gate detiene despliegue en Prod con código 2 por backlog de proveedor persistente.
+    6. `test_render_fails_on_empty_secret`: Detiene pipeline si falta `ConnectionStrings__IdentityDatabase`.
+    7. `test_render_fails_on_malformed_yaml`: Detiene pipeline ante sintaxis YAML inválida.
+    8. `test_render_fails_when_prod_pvc_not_rwx`: Detiene pipeline si el PVC de producción no es `ReadWriteMany`.
+    9. `test_render_only_flag_renders_and_validates_qa_and_prod`: Validación estructural y `kubectl kustomize` de QA y Prod en modo `--render-only`.
+  - Validación post-render de `kubectl kustomize`: Ejecutada en `dev`, `qa` y `prod` con 0 errores y sin referencias a claves PEM.
+- **Git**: Cambios preservados en working tree sobre rama `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.
+
+### 2026-10-22 — Remediación Hallazgo B-19: Mitigación de coexistencia de emisores efímeros mediante estrategia Recreate
+
+- **Problema remediado (B-19)**:
+  `dev/admin-backend/admin-backend-manifest.yaml` configuraba `replicas: 1` con `RollingUpdate` (`maxSurge: 1`, `maxUnavailable: 0`). Con claves RSA efímeras en memoria, cada instancia genera claves y `kid`s divergentes. Durante cada rollout coexistían temporalmente el pod anterior y el nuevo detrás del mismo Service `admin-backend`, provocando rechazos intermitentes de tokens.
+- **Implementación técnica**:
+  - `dev/admin-backend/admin-backend-manifest.yaml`: Modificada la estrategia de despliegue a `strategy: type: Recreate`. El pod anterior es terminado completamente antes de crear el nuevo, impidiendo cualquier solapamiento de emisores incompatibles.
+  - `scripts/render_manifests.py`: Agregada validación estricta para `dev`: si `Jwt__SigningProvider == EphemeralRsa`, rechaza despliegues de `admin-backend` con `RollingUpdate` y `maxSurge > 0` o estrategias distintas a `Recreate`.
+  - `README.md`: Documentada la justificación de `Recreate` y la aceptación formal de la breve indisponibilidad de segundos durante el reinicio para entornos de desarrollo.
+- **Pruebas automatizadas**:
+  - `scripts/test_render_manifests.py`: Agregada prueba negativa `test_dev_fails_when_rolling_update_overlaps_ephemeral_rsa` (10/10 pruebas en verde).
+  - `kubectl kustomize dev`: Validado y confirmado `strategy: type: Recreate` con 0 errores.
+- **Git**: Cambios preservados en working tree sobre rama `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.

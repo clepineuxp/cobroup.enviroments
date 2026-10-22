@@ -45,7 +45,21 @@ Las imágenes de contenedor se construyen y publican en **GitHub Container Regis
 
 ### Contrato de identidad vigente
 
-COBROUP usa exclusivamente JWT según `../cobroup.md/DECISION_AUTENTICACION_JWT.md`. BackendAdmin conserva la clave privada asimétrica y publica las claves públicas por JWKS; el backend operativo no recibe secretos de firma. Access y refresh tienen audiences separadas, y no existe clave HMAC compartida ni valor predeterminado. Los manifiestos actuales deben adecuarse y auditarse antes de cualquier despliegue; esta documentación no declara esa implementación como terminada.
+COBROUP usa exclusivamente JWT firmados con `HS256` según `../cobroup.md/DECISION_AUTENTICACION_JWT.md`. Esta regla reemplaza definitivamente RSA, PEM/PFX, JWKS, proveedores efímeros/persistentes y banderas de acknowledge.
+- Cada ambiente usa un secreto CSPRNG Base64 distinto, de 32 bytes o más: `DEV_JWT_SIGNING_KEY_BASE64`, `QA_JWT_SIGNING_KEY_BASE64` y `PROD_JWT_SIGNING_KEY_BASE64`.
+- Dentro de un ambiente, el mismo valor se inyecta como `Jwt__SigningKeyBase64` exclusivamente en `admin-backend` (emite y valida) y `backend` (solo valida). Los frontends y otras cargas no reciben el Secret.
+- Los valores reales viven en GitHub Environment Secrets/Kubernetes Secrets. Está prohibido escribirlos en Git, ConfigMap, imagen, logs, artefactos o archivos renderizados persistentes.
+- El render y el arranque deben fallar ante secreto ausente, placeholder, Base64 inválido, menos de 32 bytes o configuración de algoritmo distinta de `HS256`. No existen valores predeterminados ni fallback.
+- La rotación coordina clave activa y anteriores mediante `kid` en ambos backends y todas sus réplicas. Los controles productivos están en `../cobroup.md/BACKLOG_SEGURIDAD_FIRMA_SIMETRICA.md`.
+
+### Contrato de almacenamiento de evidencias y archivos
+
+Conforme a `../cobroup.md/DECISION_ALMACENAMIENTO_ARCHIVOS.md`:
+- Todas las fotografías de evidencias y archivos binarios se almacenan en un `PersistentVolumeClaim` (PVC) de Kubernetes montado en `/var/cobroup/evidences`.
+- En **Producción** con dos réplicas (`replicas: 2`), el PVC `backend-evidence-pvc` utiliza el modo de acceso compartido **`ReadWriteMany` (RWX)**.
+- En **Dev** y **QA**, el PVC utiliza `ReadWriteOnce` (RWO) con capacidades de `1Gi` y `5Gi` respectivamente (`10Gi` en producción).
+- La lógica de negocio y base de datos guardan exclusivamente claves relativas (`{tenantId}/{paymentId}/{hash}.{ext}`). El diseño desacoplado permite una sustitución futura por **AWS S3** (`Storage:Provider=S3`) mediante configuración e inyección de dependencias, sin reescribir Core, Domain ni contratos HTTP.
+
 
 ---
 
@@ -101,13 +115,15 @@ En **Settings ➔ Secrets and variables ➔ Actions**:
 - `GHCR_TOKEN`: PAT clásico de GitHub con scope `read:packages`.
 - `DEV_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en dev.
 - `DEV_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en dev.
-- `DEV_JWT_SIGNING_PRIVATE_KEY_BASE64`: clave privada asimétrica JWT de dev, codificada en Base64 y disponible solo para BackendAdmin.
 - `QA_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en qa.
 - `QA_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en qa.
-- `QA_JWT_SIGNING_PRIVATE_KEY_BASE64`: clave privada asimétrica JWT de QA, codificada en Base64 y disponible solo para BackendAdmin.
 - `PROD_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en prod.
 - `PROD_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en prod.
-- `PROD_JWT_SIGNING_PRIVATE_KEY_BASE64`: clave privada asimétrica JWT de producción, codificada en Base64 y disponible solo para BackendAdmin.
+- `DEV_JWT_SIGNING_KEY_BASE64`: secreto HS256 CSPRNG exclusivo de Dev, Base64 de 32 bytes o más.
+- `QA_JWT_SIGNING_KEY_BASE64`: secreto HS256 CSPRNG exclusivo de QA, Base64 de 32 bytes o más.
+- `PROD_JWT_SIGNING_KEY_BASE64`: secreto HS256 CSPRNG exclusivo de Prod, Base64 de 32 bytes o más.
+
+*(Nota: los nombres RSA/PEM anteriores fueron retirados y no deben reintroducirse. Los secretos HS256 reales nunca se escriben en el repositorio.)*
 
 ### Paso 4: Cargar Variables
 - `GHCR_USERNAME`: `clepineuxp`.

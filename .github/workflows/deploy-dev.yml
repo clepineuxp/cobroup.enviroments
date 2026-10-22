@@ -7,6 +7,7 @@ on:
     paths:
       - 'dev/**'
       - 'bootstrap/**'
+      - 'scripts/**'
       - '.github/workflows/deploy-dev.yml'
   workflow_dispatch:
 
@@ -20,95 +21,26 @@ jobs:
       - name: 1. Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 2. Set up Python for Variable Substitution
+      - name: 2. Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
 
-      - name: 3. Replace Environment Placeholders in dev/ Manifests
+      - name: 3. Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r scripts/requirements.txt
+
+      - name: 4. Render and Validate Dev Manifests
         env:
           DEV_OPERATIONSDATABASE_CONNECTIONSTRING: ${{ vars.DEV_OPERATIONSDATABASE_CONNECTIONSTRING || secrets.DEV_OPERATIONSDATABASE_CONNECTIONSTRING }}
           DEV_IDENTITYDATABASE_CONNECTIONSTRING: ${{ vars.DEV_IDENTITYDATABASE_CONNECTIONSTRING || secrets.DEV_IDENTITYDATABASE_CONNECTIONSTRING }}
-          DEV_JWT_KEY_ID: ${{ vars.DEV_JWT_KEY_ID || 'cobroup-dev-key-1' }}
-          DEV_JWT_PRIVATE_KEY_PEM: ${{ secrets.DEV_JWT_PRIVATE_KEY_PEM }}
           GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          python3 - << 'EOF'
-          import os, base64, sys
+          python scripts/render_manifests.py --env dev
 
-          P = "${" + "{"
-          S = "}}"
-
-          raw_pem = os.environ.get("DEV_JWT_PRIVATE_KEY_PEM", "").strip()
-          if raw_pem:
-              if raw_pem.startswith("LS0t") or (" " not in raw_pem and "-----" not in raw_pem):
-                  try:
-                      decoded = base64.b64decode(raw_pem).decode("utf-8")
-                      if "-----BEGIN" in decoded:
-                          raw_pem = decoded.strip()
-                  except Exception:
-                      pass
-              formatted_pem = "\n    ".join(line.strip() for line in raw_pem.splitlines() if line.strip())
-          else:
-              formatted_pem = ""
-
-          replacements = {
-              f"{P}Dev_OperationsDatabase__ConnectionString{S}": os.environ.get("DEV_OPERATIONSDATABASE_CONNECTIONSTRING", ""),
-              f"{P}Dev_IdentityDatabase__ConnectionString{S}": os.environ.get("DEV_IDENTITYDATABASE_CONNECTIONSTRING", ""),
-              f"{P}Dev_Jwt__KeyId{S}": os.environ.get("DEV_JWT_KEY_ID", ""),
-              f"{P}Dev_Jwt__PrivateKeyPem{S}": formatted_pem,
-          }
-
-          unresolved = []
-          modified_files = []
-
-          # Scan all yaml/yml files in dev directory
-          for root, dirs, files in os.walk("dev"):
-              for file in files:
-                  if file.endswith((".yaml", ".yml")):
-                      filepath = os.path.join(root, file)
-                      with open(filepath, "r", encoding="utf-8") as f:
-                          content = f.read()
-
-                      modified = content
-                      for placeholder, value in replacements.items():
-                          if value and placeholder in modified:
-                              modified = modified.replace(placeholder, value)
-                              print(f"Replaced {placeholder} in {filepath}")
-
-                      # Also substitute ghcr credentials if available
-                      ghcr_user = os.environ.get("GHCR_USERNAME")
-                      ghcr_token = os.environ.get("GHCR_TOKEN")
-                      if ghcr_user and ghcr_token and file == "ghcr-secret.yaml":
-                          auth_b64 = base64.b64encode(f"{ghcr_user}:{ghcr_token}".encode("utf-8")).decode("utf-8")
-                          modified = modified.replace("CHANGE_ME_GITHUB_USER", ghcr_user)
-                          modified = modified.replace("CHANGE_ME_GITHUB_PAT", ghcr_token)
-                          modified = modified.replace("CHANGE_ME", auth_b64)
-                          print(f"Injected GHCR credentials in {filepath}")
-
-                      if modified != content:
-                          with open(filepath, "w", encoding="utf-8") as f:
-                              f.write(modified)
-                          modified_files.append(filepath)
-
-                      if "Jwt__" in modified and P in modified:
-                          unresolved.append(filepath)
-
-          if unresolved:
-              sys.exit(f"Deployment failed: Unresolved JWT placeholders in {unresolved}")
-
-          for filepath in modified_files:
-              try:
-                  import yaml
-                  with open(filepath, "r", encoding="utf-8") as f:
-                      list(yaml.safe_load_all(f))
-                  print(f"Validated syntax for {filepath}")
-              except Exception as e:
-                  sys.exit(f"Deployment failed: YAML syntax error in {filepath}: {e}")
-          EOF
-
-      - name: 4. Ensure Target Directories on Remote Server
+      - name: 5. Ensure Target Directories on Remote Server
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -119,7 +51,7 @@ jobs:
             mkdir -p /opt/cobroup/deploys/dev
             mkdir -p /opt/cobroup/deploys/bootstrap
 
-      - name: 5. Copy Dev Manifests to /opt/cobroup/deploys/dev via SCP
+      - name: 6. Copy Dev Manifests to /opt/cobroup/deploys/dev via SCP
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -131,7 +63,7 @@ jobs:
           strip_components: 1
           overwrite: true
 
-      - name: 6. Copy Bootstrap Manifests to /opt/cobroup/deploys/bootstrap via SCP
+      - name: 7. Copy Bootstrap Manifests to /opt/cobroup/deploys/bootstrap via SCP
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -143,7 +75,7 @@ jobs:
           strip_components: 1
           overwrite: true
 
-      - name: 7. Verify Files on Remote Server
+      - name: 8. Verify Files on Remote Server
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
