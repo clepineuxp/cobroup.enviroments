@@ -12,7 +12,7 @@ Este repositorio contiene las plantillas declarativas de Kubernetes (K3s), archi
 Las imágenes de contenedor se construyen y publican en **GitHub Container Registry (`ghcr.io`)** desde sus respectivos repositorios de código:
 
 - `ghcr.io/clepineuxp/ms-cobroup-backend` (Operaciones, préstamos, clientes, pagos, agenda)
-- `ghcr.io/clepineuxp/ms-cobroup-backendadmin` (Identidad OpenIddict, multi-tenant, auditoría)
+- `ghcr.io/clepineuxp/ms-cobroup-backendadmin` (Autoridad JWT, identidad multi-tenant y auditoría)
 - `ghcr.io/clepineuxp/mf-cobroup-frontend` (PWA Recolector / Cobrador)
 - `ghcr.io/clepineuxp/mf-cobroup-frontend-admin` (PWA Portal Administrativo)
 
@@ -42,6 +42,10 @@ Las imágenes de contenedor se construyen y publican en **GitHub Container Regis
 | **Prod** | `cobroup-prod` | Admin Portal | `admin.cobroup.com` | `admin-frontend:8080` |
 | **Prod** | `cobroup-prod` | Operations API | `api.cobroup.com` | `backend:8080` |
 | **Prod** | `cobroup-prod` | Identity / Auth | `auth.cobroup.com` | `admin-backend:8080` |
+
+### Contrato de identidad vigente
+
+COBROUP usa exclusivamente JWT según `../cobroup.md/DECISION_AUTENTICACION_JWT.md`. BackendAdmin conserva la clave privada asimétrica y publica las claves públicas por JWKS; el backend operativo no recibe secretos de firma. Access y refresh tienen audiences separadas, y no existe clave HMAC compartida ni valor predeterminado. Los manifiestos actuales deben adecuarse y auditarse antes de cualquier despliegue; esta documentación no declara esa implementación como terminada.
 
 ---
 
@@ -97,13 +101,13 @@ En **Settings ➔ Secrets and variables ➔ Actions**:
 - `GHCR_TOKEN`: PAT clásico de GitHub con scope `read:packages`.
 - `DEV_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en dev.
 - `DEV_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en dev.
-- `DEV_JWT_SECRET`: Clave simétrica secreta JWT en dev.
+- `DEV_JWT_SIGNING_PRIVATE_KEY_BASE64`: clave privada asimétrica JWT de dev, codificada en Base64 y disponible solo para BackendAdmin.
 - `QA_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en qa.
 - `QA_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en qa.
-- `QA_JWT_SECRET`: Clave simétrica secreta JWT en qa.
+- `QA_JWT_SIGNING_PRIVATE_KEY_BASE64`: clave privada asimétrica JWT de QA, codificada en Base64 y disponible solo para BackendAdmin.
 - `PROD_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en prod.
 - `PROD_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en prod.
-- `PROD_JWT_SECRET`: Clave simétrica secreta JWT en prod.
+- `PROD_JWT_SIGNING_PRIVATE_KEY_BASE64`: clave privada asimétrica JWT de producción, codificada en Base64 y disponible solo para BackendAdmin.
 
 ### Paso 4: Cargar Variables
 - `GHCR_USERNAME`: `clepineuxp`.
