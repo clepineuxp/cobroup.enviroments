@@ -4,6 +4,7 @@ kind: Kustomization
 namespace: cobroup-prod
 
 resources:
+  - backend/backend-storage.yaml
   - backend/backend-manifest.yaml
   - admin-backend/admin-backend-manifest.yaml
   - frontend/frontend-manifest.yaml

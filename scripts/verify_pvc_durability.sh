@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify_pvc_durability.sh - Ejecutor de verificación operacional de durabilidad y compartición RWX del PVC.
+# verify_pvc_durability.sh - Verificación operacional de durabilidad de un PVC RWO.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backend-evidence-pvc
+  namespace: cobroup-prod
+  labels:
+    app.kubernetes.io/name: backend-evidence-storage
+    app.kubernetes.io/part-of: cobroup
+    environment: prod
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi

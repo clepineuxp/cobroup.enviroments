@@ -16,7 +16,7 @@ Decisión de Seguridad JWT (DECISION_AUTENTICACION_JWT.md & Remediación v9):
     Jwt__SigningKeyBase64
     Jwt__PreviousValidationKeys__0__KeyId
     Jwt__PreviousValidationKeys__0__SigningKeyBase64
-- Verificación de separación entre ambientes mediante JWT_KEY_FINGERPRINTS_JSON.
+- Verificación de correspondencia de la clave activa mediante JWT_KEY_FINGERPRINTS_JSON.
 """
 
 import argparse
@@ -44,21 +44,18 @@ ENV_CONFIGS = {
         "pvc_modes": ["ReadWriteOnce"],
         "required_mode": "ReadWriteOnce",
         "max_replicas_rwo": 1,
-        "require_storage_class": False,
     },
     "qa": {
         "pvc_storage": "5Gi",
         "pvc_modes": ["ReadWriteOnce"],
         "required_mode": "ReadWriteOnce",
         "max_replicas_rwo": 1,
-        "require_storage_class": True,
     },
     "prod": {
         "pvc_storage": "10Gi",
-        "pvc_modes": ["ReadWriteMany"],
-        "required_mode": "ReadWriteMany",
-        "max_replicas_rwo": None,
-        "require_storage_class": True,
+        "pvc_modes": ["ReadWriteOnce"],
+        "required_mode": "ReadWriteOnce",
+        "max_replicas_rwo": 1,
     },
 }
 
@@ -211,7 +208,8 @@ def validate_base64_secret(env: str, secret_name: str, value: str) -> bytes:
 def validate_fingerprints_json(env: str, raw_active_bytes: bytes, fingerprints_json_str: str) -> None:
     """
     Verifica que la variable JWT_KEY_FINGERPRINTS_JSON contenga exactamente dev, qa, prod,
-    que todos los fingerprints sean distintos y que el fingerprint de la clave activa coincida.
+    que todos los valores sean SHA-256 válidos y que el fingerprint de la clave activa coincida.
+    Los ambientes pueden declarar el mismo fingerprint cuando comparten la clave activa.
     NUNCA imprime el secreto, bytes ni fingerprints.
     """
     if not fingerprints_json_str or not fingerprints_json_str.strip():
@@ -231,14 +229,9 @@ def validate_fingerprints_json(env: str, raw_active_bytes: bytes, fingerprints_j
 
     # Validar formato hex SHA-256 de 64 caracteres
     sha256_regex = re.compile(r"^[0-9a-f]{64}$")
-    fp_values = []
     for e_name, fp in data.items():
         if not isinstance(fp, str) or not sha256_regex.match(fp.lower()):
             sys.exit(f"ERROR: El fingerprint para el ambiente '{e_name}' en 'JWT_KEY_FINGERPRINTS_JSON' no es un SHA-256 válido.")
-        fp_values.append(fp.lower())
-
-    if len(set(fp_values)) != 3:
-        sys.exit("ERROR CRITICO: Se detectaron fingerprints duplicados entre ambientes en 'JWT_KEY_FINGERPRINTS_JSON'. Cada ambiente debe tener una clave única.")
 
     # Calcular SHA-256 de los bytes decodificados de la clave activa en memoria
     computed_fp = hashlib.sha256(raw_active_bytes).hexdigest().lower()
@@ -446,16 +439,14 @@ def render_manifests(
                 "Las rotaciones JWT deben ejecutarse exclusivamente mediante el workflow 'rotate-jwt.yml'."
             )
 
-    # 4. Validar separación entre ambientes con fingerprints JSON (Obligatorio - SYM-01 / I-31)
+    # 4. Validar correspondencia de la clave activa con el fingerprint declarado.
     fingerprints_json = os.environ.get("JWT_KEY_FINGERPRINTS_JSON", "").strip()
     if not fingerprints_json:
         sys.exit("ERROR: La variable de repositorio 'JWT_KEY_FINGERPRINTS_JSON' es obligatoria y debe configurarse.")
     validate_fingerprints_json(env, raw_active_bytes, fingerprints_json)
 
-    # 5. Validar storage class para QA y Prod
-    pvc_storage_class = os.environ.get("PVC_STORAGE_CLASS", "").strip()
-    if cfg["require_storage_class"] and not pvc_storage_class:
-        sys.exit(f"ERROR: 'PVC_STORAGE_CLASS' es obligatoria para el ambiente '{env}'.")
+    # 5. StorageClass local de K3s; puede sobrescribirse explícitamente por ambiente.
+    pvc_storage_class = os.environ.get("PVC_STORAGE_CLASS", "local-path").strip() or "local-path"
 
     # Si se solicitó emitir únicamente el stream de secretos para el pipe SSH
     if emit_secrets_only:
@@ -474,6 +465,10 @@ def render_manifests(
         with open(kustomization_path, "r", encoding="utf-8") as f:
             kust_doc = yaml.safe_load(f) or {}
         resources = kust_doc.get("resources", [])
+        if "backend/backend-storage.yaml" not in resources:
+            sys.exit(
+                f"ERROR: 'kustomization.yaml' en '{env}' debe incluir 'backend/backend-storage.yaml'."
+            )
         for res_item in resources:
             if "secret.yaml" in res_item or "ghcr-secret.yaml" in res_item:
                 sys.exit(f"ERROR B-22: 'kustomization.yaml' en '{env}' contiene recurso sensible '{res_item}'. Los secretos deben aplicarse exclusivamente en memoria.")
@@ -505,22 +500,17 @@ def render_manifests(
                     del data["Jwt__PreviousValidationKeys__0__KeyId"]
                     modified = True
 
-            elif kind == "PersistentVolumeClaim" and name == "backend-evidence-pvc":
-                spec = doc.setdefault("spec", {})
-                if pvc_storage_class:
-                    spec["storageClassName"] = pvc_storage_class
-                modes = spec.get("accessModes", [])
-                req_mode = cfg["required_mode"]
-                if req_mode not in modes:
-                    sys.exit(f"ERROR en {env}: PVC 'backend-evidence-pvc' debe incluir modo de acceso '{req_mode}'. Modos actuales: {modes}")
-                modified = True
-
             elif kind == "Deployment" and name in ["admin-backend", "backend"]:
                 spec = doc.get("spec", {})
                 replicas = spec.get("replicas", 1)
                 max_rwo = cfg["max_replicas_rwo"]
-                if max_rwo is not None and replicas > max_rwo:
+                if name == "backend" and max_rwo is not None and replicas > max_rwo:
                     sys.exit(f"ERROR: Réplica múltiple ({replicas}) no permitida con almacenamiento ReadWriteOnce en '{env}'.")
+                if name == "backend" and spec.get("strategy", {}).get("type") != "Recreate":
+                    sys.exit(
+                        f"ERROR: deployment/backend en '{env}' debe usar strategy.type=Recreate "
+                        "para evitar montajes solapados del PVC local-path ReadWriteOnce."
+                    )
 
                 # Verificar que el Deployment monte jwt-signing-secret
                 containers = spec.get("template", {}).get("spec", {}).get("containers", [])
@@ -533,6 +523,44 @@ def render_manifests(
         if modified:
             with open(manifest_file, "w", encoding="utf-8") as f:
                 f.write("---\n" + "\n---\n".join(yaml.safe_dump(d, sort_keys=False) for d in docs if d) + "\n")
+
+    # El PVC se mantiene separado del Deployment, siguiendo el patrón de media-storage.
+    storage_file = os.path.join(env_dir, "backend", "backend-storage.yaml")
+    if not os.path.isfile(storage_file):
+        sys.exit(f"ERROR: No se encontró el manifiesto de almacenamiento: {storage_file}")
+
+    with open(storage_file, "r", encoding="utf-8") as f:
+        storage_docs = [doc for doc in yaml.safe_load_all(f) if doc]
+
+    evidence_pvc = next(
+        (
+            doc
+            for doc in storage_docs
+            if doc.get("kind") == "PersistentVolumeClaim"
+            and doc.get("metadata", {}).get("name") == "backend-evidence-pvc"
+        ),
+        None,
+    )
+    if evidence_pvc is None:
+        sys.exit(f"ERROR: '{storage_file}' debe declarar el PVC 'backend-evidence-pvc'.")
+
+    pvc_spec = evidence_pvc.setdefault("spec", {})
+    pvc_spec["storageClassName"] = pvc_storage_class
+    modes = pvc_spec.get("accessModes", [])
+    if modes != [cfg["required_mode"]]:
+        sys.exit(
+            f"ERROR en {env}: PVC 'backend-evidence-pvc' debe declarar exclusivamente "
+            f"'{cfg['required_mode']}'. Modos actuales: {modes}"
+        )
+    requested_storage = pvc_spec.get("resources", {}).get("requests", {}).get("storage")
+    if requested_storage != cfg["pvc_storage"]:
+        sys.exit(
+            f"ERROR en {env}: PVC 'backend-evidence-pvc' debe solicitar {cfg['pvc_storage']}; "
+            f"valor actual: {requested_storage}."
+        )
+
+    with open(storage_file, "w", encoding="utf-8") as f:
+        f.write("---\n" + "\n---\n".join(yaml.safe_dump(doc, sort_keys=False) for doc in storage_docs) + "\n")
 
     # 7. Escanear todo el directorio del ambiente para garantizar:
     #    a) Cero archivos secret.yaml

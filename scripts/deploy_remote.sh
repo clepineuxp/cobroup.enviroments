@@ -44,7 +44,7 @@ set +x
 echo "$SSH_KEY" | tr -d '\r' > "$DEPLOY_KEY"
 chmod 600 "$DEPLOY_KEY"
 
-echo "==> [1/5] Verificando autenticidad del host SSH ($SSH_HOST:$SSH_PORT)..."
+echo "==> [1/6] Verificando autenticidad del host SSH ($SSH_HOST:$SSH_PORT)..."
 python scripts/verify_ssh_host.py \
   --host "$SSH_HOST" \
   --port "$SSH_PORT" \
@@ -67,18 +67,18 @@ SCP_COMMON_OPTS=(
   -o BatchMode=yes
 )
 
-echo "==> [2/5] Aplicando Kubernetes Secrets en memoria vía pipe seguro (Zero Persistent YAML)..."
-python scripts/render_manifests.py --env "$ENV" --emit-secrets-stream | \
-  ssh -T "${SSH_COMMON_OPTS[@]}" "$SSH_USER@$SSH_HOST" "kubectl apply -f -"
-
-echo "==> [3/5] Preparando directorios en servidor remoto..."
+echo "==> [2/6] Preparando directorios en servidor remoto..."
 ssh -T "${SSH_COMMON_OPTS[@]}" "$SSH_USER@$SSH_HOST" "mkdir -p /opt/cobroup/deploys/$ENV /opt/cobroup/deploys/bootstrap"
 
-echo "==> [4/5] Transfiriendo manifiestos no sensibles mediante SCP con host verificado..."
+echo "==> [3/6] Transfiriendo manifiestos no sensibles mediante SCP con host verificado..."
 scp -r "${SCP_COMMON_OPTS[@]}" "$ENV"/* "$SSH_USER@$SSH_HOST:/opt/cobroup/deploys/$ENV/"
 scp -r "${SCP_COMMON_OPTS[@]}" bootstrap/* "$SSH_USER@$SSH_HOST:/opt/cobroup/deploys/bootstrap/"
 
-echo "==> [5/5] Aplicando manifiestos y ejecutando rollout secuencial seguro (Backend -> Admin-Backend)..."
+echo "==> [4/6] Aplicando Kubernetes Secrets en memoria vía pipe seguro (Zero Persistent YAML)..."
+python scripts/render_manifests.py --env "$ENV" --emit-secrets-stream | \
+  ssh -T "${SSH_COMMON_OPTS[@]}" "$SSH_USER@$SSH_HOST" "kubectl apply -f -"
+
+echo "==> [5/6] Aplicando manifiestos y ejecutando rollout secuencial seguro (Backend -> Admin-Backend)..."
 ssh -T "${SSH_COMMON_OPTS[@]}" "$SSH_USER@$SSH_HOST" bash -s <<EOF
 set -euo pipefail
 kubectl apply -k /opt/cobroup/deploys/$ENV
@@ -93,5 +93,9 @@ kubectl rollout status deployment/admin-backend -n "$KUBERNETES_NAMESPACE" --tim
 
 echo "Despliegue y rollouts completados exitosamente en namespace $KUBERNETES_NAMESPACE."
 EOF
+
+echo "==> [6/6] Verificando que el PVC de evidencias quedó enlazado..."
+ssh -T "${SSH_COMMON_OPTS[@]}" "$SSH_USER@$SSH_HOST" \
+  "kubectl get pvc backend-evidence-pvc -n '$KUBERNETES_NAMESPACE' -o wide"
 
 echo "==> Despliegue de $ENV completado con éxito."
