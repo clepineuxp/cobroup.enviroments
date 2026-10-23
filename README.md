@@ -46,7 +46,7 @@ Las imágenes de contenedor se construyen y publican en **GitHub Container Regis
 ### Contrato de identidad vigente
 
 COBROUP usa exclusivamente JWT firmados con `HS256` según `../cobroup.md/DECISION_AUTENTICACION_JWT.md`. Esta regla reemplaza definitivamente RSA, PEM/PFX, JWKS, proveedores efímeros/persistentes y banderas de acknowledge.
-- Cada GitHub Environment usa un valor distinto para el secret `JWT_ACTIVE_SIGNING_KEY_BASE64`: CSPRNG en Base64 de 32 bytes o más.
+- Los GitHub Environments pueden usar el mismo valor para `JWT_ACTIVE_SIGNING_KEY_BASE64` cuando se requiere una clave compartida; debe ser CSPRNG en Base64 de 32 bytes o más.
 - Dentro de un ambiente, el mismo valor se inyecta como `Jwt__SigningKeyBase64` exclusivamente en `admin-backend` (emite y valida) y `backend` (solo valida). Los frontends y otras cargas no reciben el Secret.
 - Los valores reales viven en GitHub Environment Secrets/Kubernetes Secrets. Está prohibido escribirlos en Git, ConfigMap, imagen, logs, artefactos o archivos renderizados persistentes.
 - El render y el arranque deben fallar ante secreto ausente, placeholder, Base64 inválido, menos de 32 bytes o configuración de algoritmo distinta de `HS256`. No existen valores predeterminados ni fallback.
@@ -56,8 +56,10 @@ COBROUP usa exclusivamente JWT firmados con `HS256` según `../cobroup.md/DECISI
 
 Conforme a `../cobroup.md/DECISION_ALMACENAMIENTO_ARCHIVOS.md`:
 - Todas las fotografías de evidencias y archivos binarios se almacenan en un `PersistentVolumeClaim` (PVC) de Kubernetes montado en `/var/cobroup/evidences`.
-- En **Producción** con dos réplicas (`replicas: 2`), el PVC `backend-evidence-pvc` utiliza el modo de acceso compartido **`ReadWriteMany` (RWX)**.
-- En **Dev** y **QA**, el PVC utiliza `ReadWriteOnce` (RWO) con capacidades de `1Gi` y `5Gi` respectivamente (`10Gi` en producción).
+- En **Dev**, **QA** y **Prod**, `backend-evidence-pvc` sigue el patrón de almacenamiento local de K3s: `ReadWriteOnce` con `storageClassName: local-path` y capacidades de `1Gi`, `5Gi` y `10Gi` respectivamente.
+- El PVC está separado del Deployment en `backend/backend-storage.yaml`, igual que el patrón de `media-storage.yaml` usado como referencia.
+- El `backend` mantiene una sola réplica y estrategia `Recreate` en todos los ambientes para evitar montajes solapados del volumen local durante un rollout.
+- `local-path` vincula los datos al nodo K3s donde se aprovisiona el volumen. La operación debe incluir copias de seguridad externas; este modelo no ofrece alta disponibilidad ni recuperación automática ante pérdida del nodo.
 - La lógica de negocio y base de datos guardan exclusivamente claves relativas (`{tenantId}/{paymentId}/{hash}.{ext}`). El diseño desacoplado permite una sustitución futura por **AWS S3** (`Storage:Provider=S3`) mediante configuración e inyección de dependencias, sin reescribir Core, Domain ni contratos HTTP.
 
 
@@ -75,7 +77,7 @@ cobroup.enviroments/
 ├── bootstrap/
 │   └── cobroup-infra-bootstrap.yaml    # Namespaces cobroup-dev, cobroup-qa, cobroup-prod
 ├── dev/
-│   ├── backend/                        # ConfigMap, Secret, Deployment, Service (Operaciones)
+│   ├── backend/                        # PVC local-path, ConfigMap, Deployment y Service
 │   ├── admin-backend/                  # ConfigMap, Secret, Deployment, Service (Identidad)
 │   ├── frontend/                       # ConfigMap, Secret, Deployment, Service (Recolector PWA)
 │   ├── admin-frontend/                 # ConfigMap, Secret, Deployment, Service (Admin PWA)
@@ -87,7 +89,7 @@ cobroup.enviroments/
 │   ├── ingress.yaml                    # Reglas de enrutamiento TLS para qa.*
 │   └── kustomization.yaml
 └── prod/
-    ├── backend/, admin-backend/, ...   # Componentes para Producción (2 réplicas)
+    ├── backend/, admin-backend/, ...   # Componentes para Producción
     ├── ingress.yaml                    # Reglas de enrutamiento TLS para producción
     └── kustomization.yaml
 ```
@@ -121,7 +123,7 @@ Crear estos secretos dentro de **cada** Environment (`dev`, `qa` y `prod`):
 |---|---:|---|
 | `OPERATIONS_DATABASE_CONNECTIONSTRING` | Sí | Cadena de conexión de Operations para ese ambiente. |
 | `IDENTITY_DATABASE_CONNECTIONSTRING` | Sí | Cadena de conexión de Identity para ese ambiente. |
-| `JWT_ACTIVE_SIGNING_KEY_BASE64` | Sí | Clave HS256 CSPRNG exclusiva del ambiente, Base64 válido de al menos 32 bytes. |
+| `JWT_ACTIVE_SIGNING_KEY_BASE64` | Sí | Clave HS256 CSPRNG en Base64 válido de al menos 32 bytes. Puede repetirse en Dev, QA y Prod. |
 | `JWT_PREVIOUS_SIGNING_KEY_BASE64` | Solo durante rotación | Clave anterior. Debe existir junto con `JWT_PREVIOUS_KEY_ID`; en estado estable debe estar ausente. |
 | `SSH_KEY` | Sí | Clave privada SSH usada por el runner para desplegar. |
 | `SSH_HOST` | Sí | IP o hostname del servidor SSH. |
@@ -144,9 +146,9 @@ Crear estas variables dentro de **cada** Environment:
 | `INGRESS_FRONTEND_ALIAS_HOST` | Solo `prod` | Alias público adicional del frontend (`www.cobroup.com`). No se crea en `dev` ni `qa`. |
 | `JWT_ACTIVE_KEY_ID` | Sí | Identificador de la clave activa, por ejemplo `k1`. |
 | `JWT_PREVIOUS_KEY_ID` | Solo durante rotación | Identificador anterior. Debe existir junto con `JWT_PREVIOUS_SIGNING_KEY_BASE64`; en estado estable debe estar ausente. |
-| `JWT_KEY_FINGERPRINTS_JSON` | Sí | JSON con los SHA-256 de las claves activas de los tres ambientes: `{"dev":"<64 hex>","qa":"<64 hex>","prod":"<64 hex>"}`. |
+| `JWT_KEY_FINGERPRINTS_JSON` | Sí | JSON con los SHA-256 de las claves activas: `{"dev":"<64 hex>","qa":"<64 hex>","prod":"<64 hex>"}`. Los tres valores pueden ser idénticos; cada despliegue valida que el suyo corresponda a `JWT_ACTIVE_SIGNING_KEY_BASE64`. |
 | `SSH_HOST_ED25519_FINGERPRINT` | Sí | Huella fijada del host SSH en formato `SHA256:<base64>`. |
-| `PVC_STORAGE_CLASS` | Sí en `qa` y `prod` | StorageClass: RWO en QA y RWX en Prod. En Dev es opcional y el workflow usa `standard` por defecto. |
+| `PVC_STORAGE_CLASS` | No | Permite sobrescribir la clase; por defecto todos los workflows usan la StorageClass incluida en K3s: `local-path`. |
 | `KUBERNETES_NAMESPACE` | No | Si se crea, debe ser exactamente `cobroup-dev`, `cobroup-qa` o `cobroup-prod`. |
 | `GHCR_USERNAME` | No | Usuario/organización de GHCR; si falta, se usa `github.actor`. |
 

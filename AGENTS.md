@@ -142,3 +142,43 @@ Este documento registra cronológicamente las intervenciones y decisiones realiz
   - Suite completa de `scripts`: 48/48 pruebas en verde.
   - `kubectl kustomize` validó satisfactoriamente `dev`, `qa` y `prod` después del render.
 - **Git**: Cambios preservados en working tree sobre `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.
+
+### 2026-10-23 — Provisionamiento dinámico NFS para StorageClass RWX
+
+- **Solicitud**: Crear el despliegue necesario para disponer de una StorageClass capaz de aprovisionar el PVC de evidencias, especialmente el acceso `ReadWriteMany` requerido en Producción.
+- **Decisión**: Reemplazar la falsa clase RWX basada en `rancher.io/local-path` por el provisionador oficial `nfs-subdir-external-provisioner`, que requiere un servidor NFS preexistente y accesible desde todos los nodos K3s.
+- **Implementación**:
+  - Nuevo `bootstrap/nfs-rwx-provisioner.yaml` con Namespace dedicado, ServiceAccount, RBAC mínimo, Deployment `v4.0.2` y StorageClass `cobroup-rwx-storage` con retención.
+  - Nuevas variables obligatorias por GitHub Environment: `NFS_SERVER` y `NFS_PATH`; el renderer valida y sustituye ambos valores sin aceptar esquemas, puertos, rutas relativas o traversal.
+  - Los workflows usan `cobroup-rwx-storage` como valor predeterminado de `PVC_STORAGE_CLASS`.
+  - `deploy_remote.sh` aplica namespaces y almacenamiento antes de los Secrets/PVC, espera el rollout del provisionador y aborta con diagnóstico si detecta la antigua StorageClass cuyo `provisioner` inmutable es incompatible.
+  - `README.md` documenta prerrequisitos NFS, variables, migración de la clase anterior y aplicación manual.
+- **Pruebas**:
+  - Agregada cobertura de validación y render NFS, estructura del Deployment y concordancia del nombre del provisionador con la StorageClass.
+  - Suite completa: 49/49 pruebas en verde.
+- **Git**: Cambios preservados en working tree sobre `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.
+
+### 2026-10-23 — Ajuste definitivo del PVC al patrón local-path de Saviaup
+
+- **Solicitud aclarada**: El PVC de COBROUP debe seguir el patrón de `saviaup.environments/dev/media/media-storage.yaml`: recurso independiente, `ReadWriteOnce` y `storageClassName: local-path`.
+- **Decisión que reemplaza la propuesta NFS anterior**: Se elimina el provisionador NFS/RWX y sus variables porque no forman parte del patrón solicitado. K3s aprovisiona el volumen mediante su StorageClass `local-path`.
+- **Implementación**:
+  - Nuevos `dev/backend/backend-storage.yaml`, `qa/backend/backend-storage.yaml` y `prod/backend/backend-storage.yaml`, incluidos desde cada `kustomization.yaml`.
+  - Los tres PVC usan `ReadWriteOnce`; las capacidades permanecen en `1Gi`, `5Gi` y `10Gi` para Dev, QA y Prod.
+  - El backend usa una réplica y estrategia `Recreate` en todos los ambientes para evitar montajes solapados durante los rollouts.
+  - `PVC_STORAGE_CLASS` pasa a ser opcional y su valor predeterminado es `local-path`; se retiraron `NFS_SERVER`, `NFS_PATH` y el bootstrap NFS.
+  - El renderer valida el manifiesto separado, el modo RWO, la capacidad, la estrategia del Deployment y la inclusión del PVC en Kustomize.
+  - El verificador operacional ahora prueba durabilidad RWO de forma secuencial: escritura, eliminación del primer pod, montaje del mismo PVC en otro pod y validación SHA-256 de los datos recuperados.
+- **Consideración operativa**: `local-path` conserva los datos en el nodo que aloja el volumen; este diseño requiere respaldo externo y no ofrece alta disponibilidad ante pérdida del nodo.
+- **Git**: Cambios preservados en working tree sobre `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.
+
+### 2026-10-23 — Fingerprint JWT compartido entre GitHub Environments
+
+- **Solicitud**: Permitir que `JWT_KEY_FINGERPRINTS_JSON` declare el mismo SHA-256 para `dev`, `qa` y `prod` cuando los tres ambientes usan la misma clave HS256 activa.
+- **Implementación**:
+  - `scripts/render_manifests.py` conserva la validación estricta del objeto JSON, las claves exactas `dev`, `qa` y `prod`, el formato SHA-256 hexadecimal y la correspondencia del valor del ambiente actual con `JWT_ACTIVE_SIGNING_KEY_BASE64`.
+  - Se retiró únicamente la prohibición de fingerprints duplicados entre ambientes.
+  - `README.md` documenta que tanto la clave activa como el fingerprint pueden compartirse entre los tres GitHub Environments.
+  - La cobertura automatizada verifica explícitamente el mismo fingerprint para Dev, QA y Prod.
+- **Almacenamiento**: Se confirma que `NFS_SERVER` y `NFS_PATH` no son requeridos ni están referenciados; el PVC utiliza `local-path`.
+- **Git**: Cambios preservados en working tree sobre `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.

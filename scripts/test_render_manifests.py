@@ -13,12 +13,12 @@ Valida:
 5. Validación segura de JWT_KEY_FINGERPRINTS_JSON:
    - JSON ausente / malformado.
    - Faltan ambientes o sobran ambientes.
-   - Fingerprints duplicados entre ambientes.
+   - Fingerprints compartidos entre ambientes.
    - Mismatch con la clave activa.
    - Coincidencia válida sin filtrar secretos.
 6. Regla B-22: Cero secretos en YAML persistente o archivos en disco.
 7. Generación dinámica en memoria de secretos para pipe SSH.
-8. Validación de almacenamiento durable PVC (RWO en dev/qa, RWX en prod, StorageClass requerida en qa/prod).
+8. Validación de almacenamiento durable PVC local-path (RWO y una réplica en dev/qa/prod).
 9. Aislamiento total de Frontends frente a secretos de backend y JWT.
 10. Rechazo de residuos RSA, PEM, JWKS y flags efímeros.
 11. Renderizado y validación estricta de hosts desde variables de GitHub Environments.
@@ -76,7 +76,7 @@ class TestRenderManifests(unittest.TestCase):
         os.environ["JWT_KEY_FINGERPRINTS_JSON"] = self.valid_fingerprints_json
         os.environ["GHCR_USERNAME"] = "testuser"
         os.environ["GHCR_TOKEN"] = "testtoken"
-        os.environ["PVC_STORAGE_CLASS"] = "standard"
+        os.environ["PVC_STORAGE_CLASS"] = "local-path"
         os.environ["INGRESS_FRONTEND_HOST"] = "dev.cobroup.com"
         os.environ["INGRESS_ADMIN_FRONTEND_HOST"] = "dev-admin.cobroup.com"
         os.environ["INGRESS_API_HOST"] = "dev-api.cobroup.com"
@@ -197,11 +197,9 @@ class TestRenderManifests(unittest.TestCase):
             validate_fingerprints_json("dev", self.dev_raw, incomplete_json)
         self.assertIn("debe contener exactamente las claves 'dev', 'qa' y 'prod'", str(ctx.exception))
 
-        # 3. Fingerprints duplicados entre ambientes
-        duplicate_json = json.dumps({"dev": self.dev_fp, "qa": self.dev_fp, "prod": self.prod_fp})
-        with self.assertRaises(SystemExit) as ctx:
-            validate_fingerprints_json("dev", self.dev_raw, duplicate_json)
-        self.assertIn("fingerprints duplicados", str(ctx.exception))
+        # 3. El mismo fingerprint puede usarse en los tres ambientes
+        shared_json = json.dumps({"dev": self.dev_fp, "qa": self.dev_fp, "prod": self.dev_fp})
+        validate_fingerprints_json("dev", self.dev_raw, shared_json)
 
         # 4. Fingerprint mismatch con la clave activa
         wrong_fp_json = json.dumps({
@@ -215,6 +213,17 @@ class TestRenderManifests(unittest.TestCase):
         # Ensure no secret or calculated fingerprint is leaked in the message
         self.assertNotIn(self.dev_fp, str(ctx.exception))
         self.assertNotIn(self.valid_dev_key, str(ctx.exception))
+
+    def test_shared_fingerprint_is_allowed_for_all_environments(self):
+        shared_json = json.dumps({
+            "dev": self.dev_fp,
+            "qa": self.dev_fp,
+            "prod": self.dev_fp,
+        })
+
+        for env_name in ("dev", "qa", "prod"):
+            with self.subTest(environment=env_name):
+                validate_fingerprints_json(env_name, self.dev_raw, shared_json)
 
     def test_zero_secrets_persisted_rule_b22(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -237,14 +246,16 @@ class TestRenderManifests(unittest.TestCase):
         self.assertIn("name: backend-secret", yaml_stream)
         self.assertIn("name: ghcr-secret", yaml_stream)
 
-    def test_storage_class_required_in_qa_and_prod(self):
+    def test_storage_class_defaults_to_local_path(self):
         del os.environ["PVC_STORAGE_CLASS"]
-        os.environ["JWT_ACTIVE_SIGNING_KEY_BASE64"] = self.valid_qa_key
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         with tempfile.TemporaryDirectory() as tmp_dir:
-            os.makedirs(os.path.join(tmp_dir, "qa"))
-            with self.assertRaises(SystemExit) as ctx:
-                render_manifests("qa", base_dir=tmp_dir)
-            self.assertIn("PVC_STORAGE_CLASS' es obligatoria", str(ctx.exception))
+            tmp_dev = os.path.join(tmp_dir, "dev")
+            shutil.copytree(os.path.join(repo_root, "dev"), tmp_dev)
+            render_manifests("dev", base_dir=tmp_dir)
+            with open(os.path.join(tmp_dev, "backend", "backend-storage.yaml"), "r", encoding="utf-8") as f:
+                storage_doc = yaml.safe_load(f)
+            self.assertEqual("local-path", storage_doc["spec"]["storageClassName"])
 
     def test_frontend_isolation_and_no_secrets_in_manifests(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -280,18 +291,18 @@ class TestRenderManifests(unittest.TestCase):
                 render_manifests("dev", base_dir=tmp_dir)
             self.assertIn("Residuo no permitido", str(ctx.exception))
 
-    def test_production_requires_rwx(self):
+    def test_production_requires_rwo(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_prod = os.path.join(tmp_dir, "prod")
             shutil.copytree(os.path.join(repo_root, "prod"), tmp_prod)
 
-            backend_manifest = os.path.join(tmp_prod, "backend", "backend-manifest.yaml")
-            with open(backend_manifest, "r", encoding="utf-8") as f:
+            backend_storage = os.path.join(tmp_prod, "backend", "backend-storage.yaml")
+            with open(backend_storage, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            content = content.replace("ReadWriteMany", "ReadWriteOnce")
-            with open(backend_manifest, "w", encoding="utf-8") as f:
+            content = content.replace("ReadWriteOnce", "ReadWriteMany")
+            with open(backend_storage, "w", encoding="utf-8") as f:
                 f.write(content)
 
             os.environ["OPERATIONS_DATABASE_CONNECTIONSTRING"] = "Host=prod;Database=prod_ops;"
@@ -301,7 +312,7 @@ class TestRenderManifests(unittest.TestCase):
 
             with self.assertRaises(SystemExit) as ctx:
                 render_manifests("prod", base_dir=tmp_dir)
-            self.assertIn("debe incluir modo de acceso 'ReadWriteMany'", str(ctx.exception))
+            self.assertIn("debe declarar exclusivamente 'ReadWriteOnce'", str(ctx.exception))
 
     def test_valid_render_all_environments(self):
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

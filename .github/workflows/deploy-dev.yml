@@ -57,7 +57,7 @@ jobs:
           GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
           KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE || 'cobroup-dev' }}
-          PVC_STORAGE_CLASS: ${{ vars.PVC_STORAGE_CLASS || 'standard' }}
+          PVC_STORAGE_CLASS: ${{ vars.PVC_STORAGE_CLASS || 'local-path' }}
         run: |
           python scripts/render_manifests.py --env dev
 
