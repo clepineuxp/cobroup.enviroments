@@ -52,8 +52,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: admin-frontend-config
-            - secretRef:
-                name: admin-frontend-secret
           resources:
             requests:
               cpu: 50m

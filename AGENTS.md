@@ -96,3 +96,34 @@ Este documento registra cronológicamente las intervenciones y decisiones realiz
     - Eliminado el gate de detención previa que bloqueaba despliegues por falta de proveedor persistente.
   - **Pruebas automatizadas (`scripts/test_render_manifests.py`)**: 16/16 pruebas en verde, cubriendo casos positivos y negativos (falta de clave, vacía, placeholder, base64 inválido, 31 bytes, 32 bytes, colisión entre ambientes, residuos legacy, aislamiento frontend y validación kustomize en dev, qa y prod).
 - **Git**: Cambios preservados en working tree; sin commit, push, merge, tag ni PR.
+### 2026-10-23 — Remediación obligatoria de hallazgos B-21 y B-23 (GitOps, Workflows y Orquestación)
+
+- **Auditoría atendida**: `cobroup.md/informe/auditoria-backend-csharp-2026-10-23-v10.html` (Hallazgos B-21 y B-23).
+- **Remediación B-21 (Rotación HS256 operacional, coordinada y recuperable)**:
+  - **Secret criptográfico unificado**: `render_manifests.py` genera en memoria `jwt-signing-secret` conteniendo `Jwt__ActiveKeyId`, `Jwt__SigningKeyBase64`, y en pareja opcional `Jwt__PreviousValidationKeys__0__KeyId` y `Jwt__PreviousValidationKeys__0__SigningKeyBase64`.
+  - **Limpieza de ConfigMaps**: Retirados `Jwt__ActiveKeyId` y cualquier referencia a JWT de `admin-backend-config` y `backend-config`. El script de render escanea los manifiestos en disco y falla si algún ConfigMap o archivo persistido contiene estado JWT.
+  - **Detección de rotación no orquestada**: Despliegues generales (`deploy-dev.yml`, `deploy-qa.yml`, `deploy-prod.yml`) abortan inmediatamente si detectan un estado de clave anterior configurado sin pasar por el orquestador dedicado de rotación (`--allow-rotation`).
+  - **Orquestador de rotación (`scripts/rotate_jwt.py`)**:
+    - Lee `jwt-signing-secret` en memoria directamente de K8s.
+    - Máquina de estados estricta: `prepublish` (activa k1, anterior k2), `activate` (activa k2, anterior k1, marca de tiempo `cobroup.com/activated-at`), `retire` (rechazo antes de 20 min / 1200s, Job K8s de revocación atómica para k1, aplica k2), `emergency` (escala `admin-backend` a 0, Job K8s de revocación total `--revoke-all`, aplica nueva clave, escala y reinicia en orden seguro).
+    - Rollback en memoria: Si falla el rollout de `deployment/backend` (timeout 180s), revierte el Secret y NO reinicia `admin-backend`. Si falla `admin-backend` (timeout 180s), revierte el Secret y recupera ambos despliegues en orden seguro.
+  - **Workflow dedicado `.github/workflows/rotate-jwt.yml`**:
+    - Disparador manual `workflow_dispatch` con choices `environment` (`dev`, `qa`, `prod`) y `action` (`prepublish`, `activate`, `retire`, `emergency`).
+    - Environment dinámico en job para vincular los Secrets de cada ambiente.
+    - Concurrency group `jwt-rotation-${{ github.event.inputs.environment }}` para prevenir ejecuciones simultáneas.
+- **Remediación B-23 (Autenticidad estricta SSH y pinning de host ED25519)**:
+  - **Prohibición absoluta**: Eliminado de todos los workflows y scripts `StrictHostKeyChecking=no` y `UserKnownHostsFile=/dev/null`.
+  - **Pinning de host ED25519 (`scripts/verify_ssh_host.py`)**:
+    - Variable obligatoria por GitHub Environment: `SSH_HOST_ED25519_FINGERPRINT` (`SHA256:<digest-base64>`).
+    - Obtiene clave pública ED25519 con `ssh-keyscan`, calcula SHA-256 localmente, valida en tiempo constante contra la variable preestablecida, y genera `known_hosts` temporal (modo 0600). Aborta antes de cualquier conexión remota si la huella no coincide, está ausente o malformada.
+  - **Script unificado de despliegue remoto (`scripts/deploy_remote.sh`)**:
+    - Directorio temporal `mktemp -d` (modo 0700) con `trap` para eliminación segura tanto en éxito como en fallo.
+    - Verifica host antes de transmitir datos. Inyecta Secrets de K8s por pipe de stdin a `kubectl apply -f -` en memoria sin persistir YAMLs en disco.
+    - Transferencia nativa por `scp` usando el `known_hosts` verificado y ejecución remota de rollout ordenado `deployment/backend` -> `deployment/admin-backend`.
+  - **Workflows actualizados**: `deploy-dev.yml`, `deploy-qa.yml`, `deploy-prod.yml` migrados a pinning estricto con `verify_ssh_host.py` y `deploy_remote.sh`, retirando actions Appleboy.
+- **Pruebas automatizadas**:
+  - `scripts/test_render_manifests.py`: 16 pruebas.
+  - `scripts/test_verify_ssh_host.py`: 9 pruebas (formato, match, mismatch, fallos previos a SSH).
+  - `scripts/test_rotate_jwt.py`: 10 pruebas (máquina de estados, orden de rollout, rollback en memoria, tiempo mínimo de retiro, Job de revocación).
+  - Total: 35/35 pruebas en verde en `cobroup.environments`.
+- **Git**: Cambios preservados en working tree; sin commit, push, merge, tag ni PR.

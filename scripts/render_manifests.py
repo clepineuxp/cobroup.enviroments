@@ -3,20 +3,28 @@
 render_manifests.py - Renderiza y valida de manera segura y reproducible
 los manifiestos de Kubernetes de COBROUP para dev, qa y prod.
 
-Decisión de Seguridad JWT (2026-10-22 - DECISION_AUTENTICACION_JWT.md):
+Decisión de Seguridad JWT (DECISION_AUTENTICACION_JWT.md & Remediación v9):
 - Algoritmo exclusivo: HS256 con secreto simétrico independiente por ambiente.
 - Secreto CSPRNG de mínimo 32 bytes (256 bits) transportado en Base64.
-- Inyección exclusiva en admin-backend y backend mediante Kubernetes Secrets.
+- Inyección en memoria/stdin vía pipe directo 'kubectl apply -f -'.
+- NUNCA se escriben secretos en disco, YAML persistente, argumentos o logs (Regla B-22).
+- Microservicios admin-backend y backend comparten Secret 'jwt-signing-secret'.
+- Cadenas de conexión residen en 'admin-backend-secret' y 'backend-secret'.
 - Frontends completamente aislados del secreto criptográfico.
-- Prohibición estricta de RSA, PEM, JWKS, proveedores efímeros y acknowledge flags.
-
-Requisitos: PyYAML (declarado en scripts/requirements.txt)
-Uso: python render_manifests.py --env [dev|qa|prod] [--base-dir .] [--render-only]
+- Contrato de rotación estricto serial:
+    Jwt__ActiveKeyId
+    Jwt__SigningKeyBase64
+    Jwt__PreviousValidationKeys__0__KeyId
+    Jwt__PreviousValidationKeys__0__SigningKeyBase64
+- Verificación de separación entre ambientes mediante JWT_KEY_FINGERPRINTS_JSON.
 """
 
 import argparse
 import base64
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,22 +40,25 @@ except ImportError:
 
 ENV_CONFIGS = {
     "dev": {
-        "prefix": "DEV_",
         "pvc_storage": "1Gi",
-        "pvc_modes": ["ReadWriteOnce", "ReadWriteMany"],
+        "pvc_modes": ["ReadWriteOnce"],
         "required_mode": "ReadWriteOnce",
+        "max_replicas_rwo": 1,
+        "require_storage_class": False,
     },
     "qa": {
-        "prefix": "QA_",
         "pvc_storage": "5Gi",
-        "pvc_modes": ["ReadWriteOnce", "ReadWriteMany"],
+        "pvc_modes": ["ReadWriteOnce"],
         "required_mode": "ReadWriteOnce",
+        "max_replicas_rwo": 1,
+        "require_storage_class": True,
     },
     "prod": {
-        "prefix": "PROD_",
         "pvc_storage": "10Gi",
         "pvc_modes": ["ReadWriteMany"],
         "required_mode": "ReadWriteMany",
+        "max_replicas_rwo": None,
+        "require_storage_class": True,
     },
 }
 
@@ -72,6 +83,27 @@ PLACEHOLDER_MARKERS = [
     "TODO",
     "YOUR_KEY",
 ]
+
+KEY_ID_REGEX = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def validate_key_id(kid_name: str, kid_value: str) -> str:
+    """Valida que el identificador de clave cumpla estrictamente con el formato requerido."""
+    if not kid_value or not kid_value.strip():
+        sys.exit(f"ERROR: El identificador '{kid_name}' es obligatorio y no puede estar vacío.")
+
+    stripped = kid_value.strip()
+    upper = stripped.upper()
+    for marker in PLACEHOLDER_MARKERS:
+        if marker in upper:
+            sys.exit(f"ERROR: El identificador '{kid_name}' contiene un placeholder no permitido ('{marker}').")
+
+    if not KEY_ID_REGEX.match(stripped):
+        sys.exit(
+            f"ERROR: El identificador '{kid_name}' ('{stripped}') no cumple con el formato requerido '^[A-Za-z0-9._-]{{1,64}}$'."
+        )
+
+    return stripped
 
 
 def validate_base64_secret(env: str, secret_name: str, value: str) -> bytes:
@@ -103,80 +135,341 @@ def validate_base64_secret(env: str, secret_name: str, value: str) -> bytes:
     return raw_bytes
 
 
-def detect_cross_environment_key_reuse() -> None:
-    """Verifica que ningún ambiente comparta el mismo secreto JWT cuando múltiples variables están presentes."""
-    env_keys = {
-        "dev": os.environ.get("DEV_JWT_SIGNING_KEY_BASE64", "").strip(),
-        "qa": os.environ.get("QA_JWT_SIGNING_KEY_BASE64", "").strip(),
-        "prod": os.environ.get("PROD_JWT_SIGNING_KEY_BASE64", "").strip(),
+def validate_fingerprints_json(env: str, raw_active_bytes: bytes, fingerprints_json_str: str) -> None:
+    """
+    Verifica que la variable JWT_KEY_FINGERPRINTS_JSON contenga exactamente dev, qa, prod,
+    que todos los fingerprints sean distintos y que el fingerprint de la clave activa coincida.
+    NUNCA imprime el secreto, bytes ni fingerprints.
+    """
+    if not fingerprints_json_str or not fingerprints_json_str.strip():
+        sys.exit("ERROR: La variable de repositorio 'JWT_KEY_FINGERPRINTS_JSON' es obligatoria.")
+
+    try:
+        data = json.loads(fingerprints_json_str.strip())
+    except Exception:
+        sys.exit("ERROR: 'JWT_KEY_FINGERPRINTS_JSON' no es un JSON válido.")
+
+    if not isinstance(data, dict):
+        sys.exit("ERROR: 'JWT_KEY_FINGERPRINTS_JSON' debe ser un objeto JSON con claves 'dev', 'qa', 'prod'.")
+
+    required_envs = {"dev", "qa", "prod"}
+    if set(data.keys()) != required_envs:
+        sys.exit("ERROR: 'JWT_KEY_FINGERPRINTS_JSON' debe contener exactamente las claves 'dev', 'qa' y 'prod'.")
+
+    # Validar formato hex SHA-256 de 64 caracteres
+    sha256_regex = re.compile(r"^[0-9a-f]{64}$")
+    fp_values = []
+    for e_name, fp in data.items():
+        if not isinstance(fp, str) or not sha256_regex.match(fp.lower()):
+            sys.exit(f"ERROR: El fingerprint para el ambiente '{e_name}' en 'JWT_KEY_FINGERPRINTS_JSON' no es un SHA-256 válido.")
+        fp_values.append(fp.lower())
+
+    if len(set(fp_values)) != 3:
+        sys.exit("ERROR CRITICO: Se detectaron fingerprints duplicados entre ambientes en 'JWT_KEY_FINGERPRINTS_JSON'. Cada ambiente debe tener una clave única.")
+
+    # Calcular SHA-256 de los bytes decodificados de la clave activa en memoria
+    computed_fp = hashlib.sha256(raw_active_bytes).hexdigest().lower()
+    expected_fp = data[env].lower()
+
+    if computed_fp != expected_fp:
+        sys.exit(f"ERROR CRITICO: El fingerprint SHA-256 de la clave activa no coincide con el registrado para el ambiente '{env}'. Despliegue abortado.")
+
+
+def emit_secrets_yaml(env: str, namespace: str) -> str:
+    """
+    Genera en memoria los manifiestos de Kubernetes Secrets codificados en base64
+    para ser aplicados directamente por pipe a 'kubectl apply -f -'.
+    NUNCA persiste estos datos en disco.
+    """
+    ops_db = os.environ.get("OPERATIONS_DATABASE_CONNECTIONSTRING", "").strip()
+    ident_db = os.environ.get("IDENTITY_DATABASE_CONNECTIONSTRING", "").strip()
+    jwt_active_b64 = os.environ.get("JWT_ACTIVE_SIGNING_KEY_BASE64", "").strip()
+    jwt_prev_b64 = os.environ.get("JWT_PREVIOUS_SIGNING_KEY_BASE64", "").strip()
+    jwt_prev_kid = os.environ.get("JWT_PREVIOUS_KEY_ID", "").strip()
+    ghcr_user = os.environ.get("GHCR_USERNAME", "").strip()
+    ghcr_token = os.environ.get("GHCR_TOKEN", "").strip()
+
+    jwt_active_kid = os.environ.get("JWT_ACTIVE_KEY_ID", "").strip()
+    jwt_active_kid = validate_key_id("JWT_ACTIVE_KEY_ID", jwt_active_kid)
+    raw_active_bytes = validate_base64_secret(env, "JWT_ACTIVE_SIGNING_KEY_BASE64", jwt_active_b64)
+
+    has_prev_b64 = bool(jwt_prev_b64)
+    has_prev_kid = bool(jwt_prev_kid)
+    if has_prev_b64 != has_prev_kid:
+        sys.exit(
+            "ERROR: Incoherencia en clave previa: 'JWT_PREVIOUS_KEY_ID' y 'JWT_PREVIOUS_SIGNING_KEY_BASE64' deben proporcionarse conjuntamente."
+        )
+
+    # 1. jwt-signing-secret (B-21: Identificadores y material criptográfico en un único Secret)
+    jwt_data = {
+        "Jwt__ActiveKeyId": base64.b64encode(jwt_active_kid.encode("utf-8")).decode("utf-8"),
+        "Jwt__SigningKeyBase64": base64.b64encode(jwt_active_b64.encode("utf-8")).decode("utf-8"),
+    }
+    if has_prev_b64:
+        valid_prev_kid = validate_key_id("JWT_PREVIOUS_KEY_ID", jwt_prev_kid)
+        if valid_prev_kid == jwt_active_kid:
+            sys.exit("ERROR: El 'JWT_PREVIOUS_KEY_ID' no puede ser idéntico al 'JWT_ACTIVE_KEY_ID'.")
+        raw_prev_bytes = validate_base64_secret(env, "JWT_PREVIOUS_SIGNING_KEY_BASE64", jwt_prev_b64)
+        if raw_prev_bytes == raw_active_bytes:
+            sys.exit("ERROR: El material criptográfico de la clave anterior no puede ser idéntico al de la clave activa.")
+
+        jwt_data["Jwt__PreviousValidationKeys__0__KeyId"] = base64.b64encode(
+            valid_prev_kid.encode("utf-8")
+        ).decode("utf-8")
+        jwt_data["Jwt__PreviousValidationKeys__0__SigningKeyBase64"] = base64.b64encode(
+            jwt_prev_b64.encode("utf-8")
+        ).decode("utf-8")
+
+    jwt_secret = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "jwt-signing-secret",
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/part-of": "cobroup",
+                "environment": env,
+            },
+        },
+        "type": "Opaque",
+        "data": jwt_data,
     }
 
-    env_names = list(env_keys.keys())
-    for i in range(len(env_names)):
-        for j in range(i + 1, len(env_names)):
-            env_a, env_b = env_names[i], env_names[j]
-            key_a, key_b = env_keys[env_a], env_keys[env_b]
-            if key_a and key_b and key_a == key_b:
-                sys.exit(
-                    f"ERROR CRITICO DE SEGURIDAD: Reutilización de clave detectada entre ambientes: "
-                    f"'{env_a}' y '{env_b}' tienen exactamente el mismo valor de secreto JWT. "
-                    f"Cada ambiente DEBE disponer de una clave CSPRNG independiente."
-                )
+    # 2. admin-backend-secret
+    admin_secret = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "admin-backend-secret",
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "admin-backend",
+                "app.kubernetes.io/part-of": "cobroup",
+                "environment": env,
+            },
+        },
+        "type": "Opaque",
+        "data": {
+            "ConnectionStrings__IdentityDatabase": base64.b64encode(ident_db.encode("utf-8")).decode("utf-8")
+        },
+    }
+
+    # 3. backend-secret
+    backend_secret = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "backend-secret",
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "backend",
+                "app.kubernetes.io/part-of": "cobroup",
+                "environment": env,
+            },
+        },
+        "type": "Opaque",
+        "data": {
+            "ConnectionStrings__OperationsDatabase": base64.b64encode(ops_db.encode("utf-8")).decode("utf-8")
+        },
+    }
+
+    docs = [jwt_secret, admin_secret, backend_secret]
+
+    # 4. ghcr-secret (si se proporcionan credenciales)
+    if ghcr_user and ghcr_token:
+        auth_str = base64.b64encode(f"{ghcr_user}:{ghcr_token}".encode("utf-8")).decode("utf-8")
+        docker_config = {
+            "auths": {
+                "ghcr.io": {
+                    "username": ghcr_user,
+                    "password": ghcr_token,
+                    "auth": auth_str,
+                }
+            }
+        }
+        docker_json_bytes = json.dumps(docker_config).encode("utf-8")
+        ghcr_secret = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "ghcr-secret",
+                "namespace": namespace,
+                "labels": {
+                    "app.kubernetes.io/part-of": "cobroup",
+                    "environment": env,
+                },
+            },
+            "type": "kubernetes.io/dockerconfigjson",
+            "data": {
+                ".dockerconfigjson": base64.b64encode(docker_json_bytes).decode("utf-8")
+            },
+        }
+        docs.append(ghcr_secret)
+
+    return "---\n" + "\n---\n".join(yaml.safe_dump(doc, sort_keys=False) for doc in docs)
 
 
-def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -> None:
+def render_manifests(
+    env: str,
+    base_dir: str = ".",
+    emit_secrets_only: bool = False,
+    allow_rotation: bool = False,
+) -> None:
     if env not in ENV_CONFIGS:
         sys.exit(f"ERROR: Ambiente desconocido '{env}'. Valores válidos: dev, qa, prod.")
 
     cfg = ENV_CONFIGS[env]
-    prefix = cfg["prefix"]
     env_dir = os.path.join(base_dir, env)
+    namespace = os.environ.get("KUBERNETES_NAMESPACE", f"cobroup-{env}").strip()
+    expected_namespace = f"cobroup-{env}"
+    if namespace != expected_namespace:
+        sys.exit(
+            f"ERROR: KUBERNETES_NAMESPACE ('{namespace}') no coincide con el namespace requerido para '{env}' ('{expected_namespace}')."
+        )
 
+    # 1. Validar variables secretas requeridas
+    ops_db = os.environ.get("OPERATIONS_DATABASE_CONNECTIONSTRING", "").strip()
+    ident_db = os.environ.get("IDENTITY_DATABASE_CONNECTIONSTRING", "").strip()
+    jwt_active_b64 = os.environ.get("JWT_ACTIVE_SIGNING_KEY_BASE64", "").strip()
+    jwt_prev_b64 = os.environ.get("JWT_PREVIOUS_SIGNING_KEY_BASE64", "").strip()
+
+    missing_secrets = []
+    if not ops_db:
+        missing_secrets.append("OPERATIONS_DATABASE_CONNECTIONSTRING")
+    if not ident_db:
+        missing_secrets.append("IDENTITY_DATABASE_CONNECTIONSTRING")
+    if not jwt_active_b64:
+        missing_secrets.append("JWT_ACTIVE_SIGNING_KEY_BASE64")
+
+    if missing_secrets:
+        sys.exit(f"ERROR: Faltan secretos requeridos para '{env}': {', '.join(missing_secrets)}")
+
+    # 2. Validar variables no secretas
+    jwt_active_kid = validate_key_id("JWT_ACTIVE_KEY_ID", os.environ.get("JWT_ACTIVE_KEY_ID", ""))
+    jwt_prev_kid = os.environ.get("JWT_PREVIOUS_KEY_ID", "").strip()
+
+    # 3. Validar claves criptográficas y reglas de rotación
+    raw_active_bytes = validate_base64_secret(env, "JWT_ACTIVE_SIGNING_KEY_BASE64", jwt_active_b64)
+
+    has_prev_key = bool(jwt_prev_b64)
+    has_prev_kid = bool(jwt_prev_kid)
+    if has_prev_key != has_prev_kid:
+        sys.exit("ERROR: 'JWT_PREVIOUS_KEY_ID' y 'JWT_PREVIOUS_SIGNING_KEY_BASE64' deben estar ambos presentes o ambos ausentes.")
+
+    raw_prev_bytes = None
+    if has_prev_key:
+        validated_prev_kid = validate_key_id("JWT_PREVIOUS_KEY_ID", jwt_prev_kid)
+        if validated_prev_kid == jwt_active_kid:
+            sys.exit("ERROR: El 'JWT_PREVIOUS_KEY_ID' no puede ser idéntico al 'JWT_ACTIVE_KEY_ID'.")
+
+        raw_prev_bytes = validate_base64_secret(env, "JWT_PREVIOUS_SIGNING_KEY_BASE64", jwt_prev_b64)
+        if raw_prev_bytes == raw_active_bytes:
+            sys.exit("ERROR: El material criptográfico de la clave anterior no puede ser idéntico al de la clave activa.")
+
+        # Regla A.3 / 20: Despliegues generales abortan si detectan una rotación no orquestada
+        if not allow_rotation:
+            sys.exit(
+                "ERROR: Se detectó configuración de clave previa en despliegue general no orquestado. "
+                "Las rotaciones JWT deben ejecutarse exclusivamente mediante el workflow 'rotate-jwt.yml'."
+            )
+
+    # 4. Validar separación entre ambientes con fingerprints JSON (Obligatorio - SYM-01 / I-31)
+    fingerprints_json = os.environ.get("JWT_KEY_FINGERPRINTS_JSON", "").strip()
+    if not fingerprints_json:
+        sys.exit("ERROR: La variable de repositorio 'JWT_KEY_FINGERPRINTS_JSON' es obligatoria y debe configurarse.")
+    validate_fingerprints_json(env, raw_active_bytes, fingerprints_json)
+
+    # 5. Validar storage class para QA y Prod
+    pvc_storage_class = os.environ.get("PVC_STORAGE_CLASS", "").strip()
+    if cfg["require_storage_class"] and not pvc_storage_class:
+        sys.exit(f"ERROR: 'PVC_STORAGE_CLASS' es obligatoria para el ambiente '{env}'.")
+
+    # Si se solicitó emitir únicamente el stream de secretos para el pipe SSH
+    if emit_secrets_only:
+        sys.stdout.write(emit_secrets_yaml(env, namespace))
+        return
+
+    # 6. Actualizar manifiestos no sensibles en disco (ConfigMaps y PVC)
     if not os.path.isdir(env_dir):
         sys.exit(f"ERROR: No se encontró el directorio de manifiestos: {env_dir}")
 
-    # 1. Validar variables requeridas de entorno
-    ops_db = os.environ.get(f"{prefix}OPERATIONSDATABASE_CONNECTIONSTRING", "").strip()
-    ident_db = os.environ.get(f"{prefix}IDENTITYDATABASE_CONNECTIONSTRING", "").strip()
-    jwt_key = os.environ.get(f"{prefix}JWT_SIGNING_KEY_BASE64", "").strip()
+    # Verificar kustomization.yaml: REGLA B-22 - NO debe contener secret.yaml ni ghcr-secret.yaml
+    kustomization_path = os.path.join(env_dir, "kustomization.yaml")
+    if os.path.isfile(kustomization_path):
+        with open(kustomization_path, "r", encoding="utf-8") as f:
+            kust_doc = yaml.safe_load(f) or {}
+        resources = kust_doc.get("resources", [])
+        for res_item in resources:
+            if "secret.yaml" in res_item or "ghcr-secret.yaml" in res_item:
+                sys.exit(f"ERROR B-22: 'kustomization.yaml' en '{env}' contiene recurso sensible '{res_item}'. Los secretos deben aplicarse exclusivamente en memoria.")
 
-    missing_vars = []
-    if not ops_db:
-        missing_vars.append(f"{prefix}OPERATIONSDATABASE_CONNECTIONSTRING")
-    if not ident_db:
-        missing_vars.append(f"{prefix}IDENTITYDATABASE_CONNECTIONSTRING")
-    if not jwt_key:
-        missing_vars.append(f"{prefix}JWT_SIGNING_KEY_BASE64")
+    # Actualizar ConfigMaps en admin-backend y backend: retirar cualquier identificador o dato JWT
+    for svc_name in ["admin-backend", "backend"]:
+        manifest_file = os.path.join(env_dir, svc_name, f"{svc_name}-manifest.yaml")
+        if not os.path.isfile(manifest_file):
+            sys.exit(f"ERROR: No se encontró el manifiesto de servicio: {manifest_file}")
 
-    if missing_vars:
-        sys.exit(f"ERROR: Faltan variables requeridas para el ambiente '{env}': {', '.join(missing_vars)}")
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            docs = list(yaml.safe_load_all(f))
 
-    # Validar formato y longitud criptográfica de la clave JWT
-    validate_base64_secret(env, f"{prefix}JWT_SIGNING_KEY_BASE64", jwt_key)
+        modified = False
+        for doc in docs:
+            if not doc:
+                continue
+            kind = doc.get("kind")
+            meta = doc.get("metadata", {})
+            name = meta.get("name")
 
-    # Detectar reutilización cruzada de claves entre ambientes
-    detect_cross_environment_key_reuse()
+            if kind == "ConfigMap" and name in ["admin-backend-config", "backend-config"]:
+                data = doc.setdefault("data", {})
+                # B-21: Los identificadores JWT residen exclusivamente en 'jwt-signing-secret'
+                if "Jwt__ActiveKeyId" in data:
+                    del data["Jwt__ActiveKeyId"]
+                    modified = True
+                if "Jwt__PreviousValidationKeys__0__KeyId" in data:
+                    del data["Jwt__PreviousValidationKeys__0__KeyId"]
+                    modified = True
 
-    # 2. Mapa de sustitución exacta para placeholders ${{...}}
-    p_open = "${" + "{"
-    p_close = "}}"
-    title_prefix = prefix.capitalize()  # "Dev_", "Qa_", "Prod_"
+            elif kind == "PersistentVolumeClaim" and name == "backend-evidence-pvc":
+                spec = doc.setdefault("spec", {})
+                if pvc_storage_class:
+                    spec["storageClassName"] = pvc_storage_class
+                modes = spec.get("accessModes", [])
+                req_mode = cfg["required_mode"]
+                if req_mode not in modes:
+                    sys.exit(f"ERROR en {env}: PVC 'backend-evidence-pvc' debe incluir modo de acceso '{req_mode}'. Modos actuales: {modes}")
+                modified = True
 
-    replacements = {
-        f"{p_open}{title_prefix}OperationsDatabase__ConnectionString{p_close}": ops_db,
-        f"{p_open}{title_prefix}IdentityDatabase__ConnectionString{p_close}": ident_db,
-        f"{p_open}{title_prefix}Jwt__SigningKeyBase64{p_close}": jwt_key,
-    }
+            elif kind == "Deployment" and name in ["admin-backend", "backend"]:
+                spec = doc.get("spec", {})
+                replicas = spec.get("replicas", 1)
+                max_rwo = cfg["max_replicas_rwo"]
+                if max_rwo is not None and replicas > max_rwo:
+                    sys.exit(f"ERROR: Réplica múltiple ({replicas}) no permitida con almacenamiento ReadWriteOnce en '{env}'.")
 
-    ghcr_user = os.environ.get("GHCR_USERNAME", "").strip()
-    ghcr_token = os.environ.get("GHCR_TOKEN", "").strip()
+                # Verificar que el Deployment monte jwt-signing-secret
+                containers = spec.get("template", {}).get("spec", {}).get("containers", [])
+                for container in containers:
+                    env_from = container.get("envFrom", [])
+                    secret_names = [e.get("secretRef", {}).get("name") for e in env_from if "secretRef" in e]
+                    if "jwt-signing-secret" not in secret_names:
+                        sys.exit(f"ERROR: Contenedor '{container.get('name')}' en {svc_name} debe incluir secretRef 'jwt-signing-secret'.")
 
-    # 3. Escanear y sustituir en todos los archivos YAML del ambiente
-    substituted_files = []
+        if modified:
+            with open(manifest_file, "w", encoding="utf-8") as f:
+                f.write("---\n" + "\n---\n".join(yaml.safe_dump(d, sort_keys=False) for d in docs if d) + "\n")
+
+    # 7. Escanear todo el directorio del ambiente para garantizar:
+    #    a) Cero archivos secret.yaml
+    #    b) Cero placeholders residuales
+    #    c) Cero residuos PEM/RSA/JWKS
+    #    d) Ninguna clave JWT expuesta en frontends
+    #    e) Ningún identificador o secreto JWT en ConfigMaps ni manifiestos no sensibles (B-21)
     all_yaml_files = []
-
     for root, _, files in os.walk(env_dir):
         for file in files:
+            if file == "secret.yaml" or file == "ghcr-secret.yaml":
+                sys.exit(f"ERROR B-22: Archivo sensible persistido detectado en disco: {os.path.join(root, file)}")
             if file.endswith((".yaml", ".yml")):
                 filepath = os.path.join(root, file)
                 all_yaml_files.append(filepath)
@@ -184,166 +477,26 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read()
 
-                modified = content
-                for placeholder, val in replacements.items():
-                    if placeholder in modified:
-                        modified = modified.replace(placeholder, val)
-                        placeholder_name = placeholder.strip("${}")
-                        # Sanitize logging: NEVER log secret values
-                        if "Jwt" in placeholder_name or "Secret" in placeholder_name or "Key" in placeholder_name:
-                            print(f"[OK] Sustituido '{placeholder_name}' (redactado) en {os.path.relpath(filepath, base_dir)}")
-                        else:
-                            print(f"[OK] Sustituido '{placeholder_name}' en {os.path.relpath(filepath, base_dir)}")
+                for marker in PLACEHOLDER_MARKERS:
+                    if marker in content:
+                        sys.exit(f"ERROR: Placeholder '{marker}' no resuelto en {os.path.relpath(filepath, base_dir)}")
 
-                if file == "ghcr-secret.yaml" and ghcr_user and ghcr_token:
-                    auth_b64 = base64.b64encode(f"{ghcr_user}:{ghcr_token}".encode("utf-8")).decode("utf-8")
-                    modified = modified.replace("CHANGE_ME_GITHUB_USER", ghcr_user)
-                    modified = modified.replace("CHANGE_ME_GITHUB_PAT", ghcr_token)
-                    modified = modified.replace("CHANGE_ME", auth_b64)
-                    print(f"[OK] Inyectadas credenciales GHCR en {os.path.relpath(filepath, base_dir)}")
+                for forbidden in FORBIDDEN_LEGACY_PATTERNS:
+                    if forbidden in content:
+                        sys.exit(f"ERROR: Residuo no permitido '{forbidden}' en {os.path.relpath(filepath, base_dir)}")
 
-                if modified != content:
-                    with open(filepath, "w", encoding="utf-8") as f:
-                        f.write(modified)
-                    substituted_files.append(filepath)
+                rel_path = os.path.relpath(filepath, base_dir).replace("\\", "/")
+                # Regla B-21: ConfigMaps y recursos no sensibles no deben contener estado JWT
+                for forbidden_jwt in ["Jwt__ActiveKeyId", "Jwt__SigningKeyBase64", "Jwt__PreviousValidationKeys"]:
+                    if forbidden_jwt in content:
+                        sys.exit(
+                            f"ERROR B-21: Se detectó configuración JWT ('{forbidden_jwt}') en manifiesto no sensible '{rel_path}'. "
+                            f"Todo el estado criptográfico JWT debe residir exclusivamente en el Secret 'jwt-signing-secret'."
+                        )
 
-    # 4. Validar ausencia de placeholders no resueltos y rechazo estricto de términos RSA/JWKS/PEM/Acknowledge
-    unresolved = []
-    for filepath in all_yaml_files:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-        if p_open in content:
-            unresolved.append(f"{os.path.relpath(filepath, base_dir)} (placeholders sin resolver)")
-        for forbidden in FORBIDDEN_LEGACY_PATTERNS:
-            if forbidden in content:
-                unresolved.append(f"{os.path.relpath(filepath, base_dir)} (residuo no permitido: {forbidden})")
-        if "CHANGE_ME" in content and not (ghcr_user and ghcr_token):
-            unresolved.append(f"{os.path.relpath(filepath, base_dir)} (credenciales GHCR pendientes)")
-
-        # Validar aislamiento de Frontend: NINGUN frontend debe contener la clave JWT
-        rel_path = os.path.relpath(filepath, base_dir).replace("\\", "/")
-        if "frontend" in rel_path and not "admin-backend" in rel_path and not "backend" in rel_path:
-            if "Jwt__SigningKeyBase64" in content or (jwt_key and jwt_key in content):
-                unresolved.append(f"{rel_path} (VIOLACION CRITICA: la clave JWT no debe inyectarse en frontends)")
-
-    if unresolved:
-        sys.exit(f"ERROR: Placeholders o residuos pendientes de saneamiento en:\n  - " + "\n  - ".join(unresolved))
-
-    # 5. Validar sintaxis YAML estricta de todos los archivos del ambiente
-    for filepath in all_yaml_files:
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                docs = list(yaml.safe_load_all(f))
-            print(f"[OK] Sintaxis YAML válida: {os.path.relpath(filepath, base_dir)} ({len(docs)} documentos)")
-        except Exception as e:
-            sys.exit(f"ERROR: Sintaxis YAML inválida en {os.path.relpath(filepath, base_dir)}: {e}")
-
-    # 6. Validar estructura Kubernetes y requerimientos B-09 de almacenamiento durable
-    backend_manifest = os.path.join(env_dir, "backend", "backend-manifest.yaml")
-    if not os.path.isfile(backend_manifest):
-        sys.exit(f"ERROR: Falta el manifiesto operativo {backend_manifest}")
-
-    with open(backend_manifest, "r", encoding="utf-8") as f:
-        docs = list(yaml.safe_load_all(f))
-
-    pvc_found = False
-    mount_found = False
-    volume_found = False
-    storage_provider_ok = False
-    evidence_path_ok = False
-    backend_active_kid_ok = False
-
-    for doc in docs:
-        if not doc:
-            continue
-        kind = doc.get("kind")
-        meta = doc.get("metadata", {})
-        name = meta.get("name")
-
-        if kind == "PersistentVolumeClaim" and name == "backend-evidence-pvc":
-            pvc_found = True
-            spec = doc.get("spec", {})
-            modes = spec.get("accessModes", [])
-            req_mode = cfg["required_mode"]
-            if req_mode not in modes:
-                sys.exit(
-                    f"ERROR en {env}: PVC 'backend-evidence-pvc' debe incluir modo de acceso '{req_mode}', "
-                    f"pero tiene: {modes}."
-                )
-            print(f"[OK] Verificado PersistentVolumeClaim 'backend-evidence-pvc' con modo '{req_mode}'.")
-
-        elif kind == "Deployment" and name == "backend":
-            spec = doc.get("spec", {}).get("template", {}).get("spec", {})
-            for vol in spec.get("volumes", []):
-                if vol.get("name") == "backend-evidence-volume":
-                    pvc_ref = vol.get("persistentVolumeClaim", {}).get("claimName")
-                    if pvc_ref == "backend-evidence-pvc":
-                        volume_found = True
-
-            for container in spec.get("containers", []):
-                if container.get("name") == "backend":
-                    for mount in container.get("volumeMounts", []):
-                        if mount.get("name") == "backend-evidence-volume" and mount.get("mountPath") == "/var/cobroup/evidences":
-                            mount_found = True
-
-        elif kind == "ConfigMap" and name == "backend-config":
-            data = doc.get("data", {})
-            if data.get("Storage__Provider") == "FileSystem":
-                storage_provider_ok = True
-            if data.get("Storage__EvidencePath") == "/var/cobroup/evidences":
-                evidence_path_ok = True
-            if data.get("Jwt__ActiveKeyId"):
-                backend_active_kid_ok = True
-
-    if not pvc_found:
-        sys.exit(f"ERROR: PersistentVolumeClaim 'backend-evidence-pvc' no encontrado en {backend_manifest}")
-    if not volume_found:
-        sys.exit(f"ERROR: Volume 'backend-evidence-volume' no encontrado en el Deployment backend")
-    if not mount_found:
-        sys.exit(f"ERROR: VolumeMount '/var/cobroup/evidences' no encontrado en el contenedor backend")
-    if not (storage_provider_ok and evidence_path_ok):
-        sys.exit(f"ERROR: ConfigMap 'backend-config' no configura Storage__Provider o Storage__EvidencePath correctamente")
-    if not backend_active_kid_ok:
-        sys.exit(f"ERROR: ConfigMap 'backend-config' no configura 'Jwt__ActiveKeyId'")
-
-    print("[OK] Verificación de almacenamiento durable completada exitosamente.")
-
-    # 7. Validar configuración simétrica HS256 de BackendAdmin
-    admin_backend_manifest = os.path.join(env_dir, "admin-backend", "admin-backend-manifest.yaml")
-    if not os.path.isfile(admin_backend_manifest):
-        sys.exit(f"ERROR: Falta el manifiesto de administración {admin_backend_manifest}")
-
-    with open(admin_backend_manifest, "r", encoding="utf-8") as f:
-        admin_docs = list(yaml.safe_load_all(f))
-
-    admin_active_kid_ok = False
-    admin_deployment = None
-
-    for doc in admin_docs:
-        if not doc:
-            continue
-        if doc.get("kind") == "ConfigMap" and doc.get("metadata", {}).get("name") == "admin-backend-config":
-            data = doc.get("data", {})
-            if data.get("Jwt__ActiveKeyId"):
-                admin_active_kid_ok = True
-        elif doc.get("kind") == "Deployment" and doc.get("metadata", {}).get("name") == "admin-backend":
-            admin_deployment = doc
-
-    if not admin_active_kid_ok:
-        sys.exit(f"ERROR: ConfigMap 'admin-backend-config' debe especificar 'Jwt__ActiveKeyId'.")
-    if not admin_deployment:
-        sys.exit(f"ERROR: Deployment 'admin-backend' no encontrado en {admin_backend_manifest}")
-
-    # Verificar que el secreto admin-backend-secret y backend-secret contengan Jwt__SigningKeyBase64
-    for svc_name in ["admin-backend", "backend"]:
-        sec_path = os.path.join(env_dir, svc_name, "secret.yaml")
-        with open(sec_path, "r", encoding="utf-8") as f:
-            sec_doc = yaml.safe_load(f)
-        str_data = sec_doc.get("stringData", {})
-        if "Jwt__SigningKeyBase64" not in str_data or not str_data["Jwt__SigningKeyBase64"]:
-            sys.exit(f"ERROR: {svc_name}/secret.yaml no contiene 'Jwt__SigningKeyBase64' resuelto.")
-
-    print(f"[OK] Verificada configuración simétrica HS256 consistente para admin-backend y backend en '{env}'.")
+                if "frontend" in rel_path and not "admin-backend" in rel_path and not "backend" in rel_path:
+                    if "jwt-signing-secret" in content or "SigningKeyBase64" in content or jwt_active_b64 in content:
+                        sys.exit(f"ERROR CRITICO: Clave o Secret JWT expuesto a frontend en {rel_path}")
 
     # 8. Validar con kubectl kustomize si la herramienta está disponible
     kubectl_bin = shutil.which("kubectl")
@@ -351,11 +504,11 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
         res = subprocess.run([kubectl_bin, "kustomize", env_dir], capture_output=True, text=True)
         if res.returncode != 0:
             sys.exit(f"ERROR: 'kubectl kustomize {env_dir}' falló:\n{res.stderr}")
-        print(f"[OK] 'kubectl kustomize {env_dir}' ejecutado y validado exitosamente.")
+        print(f"[OK] 'kubectl kustomize {env_dir}' ejecutado y validado exitosamente (0 secretos persistidos).")
     else:
         print("[INFO] 'kubectl' no encontrado en PATH. Omisión de renderizado kustomize local.")
 
-    print(f"\nRenderizado y validación de manifiestos para '{env}' completado con éxito (HS256 per-environment).")
+    print(f"\n[OK] Manifiestos no sensibles para '{env}' validados y listos para SCP seguro.")
 
 
 def main():
@@ -363,13 +516,23 @@ def main():
     parser.add_argument("--env", required=True, choices=["dev", "qa", "prod"], help="Ambiente objetivo.")
     parser.add_argument("--base-dir", default=".", help="Directorio raíz del repositorio de ambientes.")
     parser.add_argument(
-        "--render-only",
+        "--emit-secrets-stream",
         action="store_true",
-        help="Modo render-only.",
+        help="Emite los Kubernetes Secrets dinámicamente en stdout para pipe seguro 'kubectl apply -f -' sobre SSH stdin.",
+    )
+    parser.add_argument(
+        "--allow-rotation",
+        action="store_true",
+        help="Permite la inclusión de claves anteriores durante operaciones de rotación orquestadas.",
     )
     args = parser.parse_args()
 
-    render_manifests(args.env, args.base_dir, render_only=args.render_only)
+    render_manifests(
+        args.env,
+        args.base_dir,
+        emit_secrets_only=args.emit_secrets_stream,
+        allow_rotation=args.allow_rotation,
+    )
 
 
 if __name__ == "__main__":

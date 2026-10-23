@@ -1,0 +1,71 @@
+name: Rotate JWT HS256 Signing Key
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente objetivo para la rotación JWT'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+      action:
+        description: 'Acción de la máquina de estados de rotación'
+        required: true
+        type: choice
+        options:
+          - prepublish
+          - activate
+          - retire
+          - emergency
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  rotate-jwt:
+    name: Rotate JWT Key (${{ inputs.action }}) in ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: 2. Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: '3.12'
+
+      - name: 3. Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r scripts/requirements.txt
+
+      - name: 4. Run Pre-flight Test Gates
+        run: |
+          python -m unittest scripts/test_render_manifests.py -v
+          python -m unittest scripts/test_verify_ssh_host.py -v
+          python -m unittest scripts/test_rotate_jwt.py -v
+
+      - name: 5. Execute Coordinated JWT Rotation
+        env:
+          JWT_ACTIVE_SIGNING_KEY_BASE64: ${{ secrets.JWT_ACTIVE_SIGNING_KEY_BASE64 }}
+          JWT_PREVIOUS_SIGNING_KEY_BASE64: ${{ secrets.JWT_PREVIOUS_SIGNING_KEY_BASE64 }}
+          JWT_ACTIVE_KEY_ID: ${{ vars.JWT_ACTIVE_KEY_ID }}
+          JWT_PREVIOUS_KEY_ID: ${{ vars.JWT_PREVIOUS_KEY_ID }}
+          JWT_KEY_FINGERPRINTS_JSON: ${{ vars.JWT_KEY_FINGERPRINTS_JSON }}
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE || format('cobroup-{0}', inputs.environment) }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          SSH_HOST_ED25519_FINGERPRINT: ${{ vars.SSH_HOST_ED25519_FINGERPRINT }}
+        run: |
+          python scripts/rotate_jwt.py --env "${{ inputs.environment }}" --action "${{ inputs.action }}"

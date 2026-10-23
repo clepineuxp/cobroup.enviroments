@@ -1,9 +1,8 @@
-name: Export Production Manifests via SSH
+name: Deploy Prod Manifests via SSH
 
 on:
   push:
     branches:
-      - main
       - prod
     paths:
       - 'prod/**'
@@ -12,18 +11,22 @@ on:
       - '.github/workflows/deploy-prod.yml'
   workflow_dispatch:
 
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
-  export-to-server:
-    name: Export Production Manifests to Remote Server
+  deploy-prod:
+    name: Deploy Prod Manifests to Remote Cluster
     runs-on: ubuntu-latest
-    environment: cobroup
+    environment: prod
 
     steps:
       - name: 1. Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: 2. Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: '3.12'
 
@@ -32,58 +35,44 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r scripts/requirements.txt
 
-      - name: 4. Render and Validate Production Manifests
+      - name: 4. Run Security and Manifest Validation Gates
+        run: |
+          python -m unittest scripts/test_render_manifests.py -v
+          python -m unittest scripts/test_verify_ssh_host.py -v
+
+      - name: 5. Render and Validate Prod Manifests (Non-Sensitive)
         env:
-          PROD_OPERATIONSDATABASE_CONNECTIONSTRING: ${{ vars.PROD_OPERATIONSDATABASE_CONNECTIONSTRING || secrets.PROD_OPERATIONSDATABASE_CONNECTIONSTRING }}
-          PROD_IDENTITYDATABASE_CONNECTIONSTRING: ${{ vars.PROD_IDENTITYDATABASE_CONNECTIONSTRING || secrets.PROD_IDENTITYDATABASE_CONNECTIONSTRING }}
-          PROD_JWT_SIGNING_KEY_BASE64: ${{ secrets.PROD_JWT_SIGNING_KEY_BASE64 }}
+          OPERATIONS_DATABASE_CONNECTIONSTRING: ${{ secrets.OPERATIONS_DATABASE_CONNECTIONSTRING }}
+          IDENTITY_DATABASE_CONNECTIONSTRING: ${{ secrets.IDENTITY_DATABASE_CONNECTIONSTRING }}
+          JWT_ACTIVE_SIGNING_KEY_BASE64: ${{ secrets.JWT_ACTIVE_SIGNING_KEY_BASE64 }}
+          JWT_PREVIOUS_SIGNING_KEY_BASE64: ${{ secrets.JWT_PREVIOUS_SIGNING_KEY_BASE64 }}
+          JWT_ACTIVE_KEY_ID: ${{ vars.JWT_ACTIVE_KEY_ID }}
+          JWT_PREVIOUS_KEY_ID: ${{ vars.JWT_PREVIOUS_KEY_ID }}
+          JWT_KEY_FINGERPRINTS_JSON: ${{ vars.JWT_KEY_FINGERPRINTS_JSON }}
           GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE || 'cobroup-prod' }}
+          PVC_STORAGE_CLASS: ${{ vars.PVC_STORAGE_CLASS }}
         run: |
           python scripts/render_manifests.py --env prod
 
-      - name: 5. Ensure Target Directories on Remote Server
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          script: |
-            mkdir -p /opt/cobroup/deploys/prod
-            mkdir -p /opt/cobroup/deploys/bootstrap
-
-      - name: 6. Copy Production Manifests to /opt/cobroup/deploys/prod via SCP
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          source: "prod/*"
-          target: "/opt/cobroup/deploys/prod"
-          strip_components: 1
-          overwrite: true
-
-      - name: 7. Copy Bootstrap Manifests to /opt/cobroup/deploys/bootstrap via SCP
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          source: "bootstrap/*"
-          target: "/opt/cobroup/deploys/bootstrap"
-          strip_components: 1
-          overwrite: true
-
-      - name: 8. Verify Files on Remote Server
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          script: |
-            echo "Manifests successfully exported to /opt/cobroup/deploys/prod:"
-            ls -la /opt/cobroup/deploys/prod
+      - name: 6. Deploy Prod Remotely with Strict SSH Pinning & Safe Rollout
+        env:
+          ENV: prod
+          OPERATIONS_DATABASE_CONNECTIONSTRING: ${{ secrets.OPERATIONS_DATABASE_CONNECTIONSTRING }}
+          IDENTITY_DATABASE_CONNECTIONSTRING: ${{ secrets.IDENTITY_DATABASE_CONNECTIONSTRING }}
+          JWT_ACTIVE_SIGNING_KEY_BASE64: ${{ secrets.JWT_ACTIVE_SIGNING_KEY_BASE64 }}
+          JWT_PREVIOUS_SIGNING_KEY_BASE64: ${{ secrets.JWT_PREVIOUS_SIGNING_KEY_BASE64 }}
+          JWT_ACTIVE_KEY_ID: ${{ vars.JWT_ACTIVE_KEY_ID }}
+          JWT_PREVIOUS_KEY_ID: ${{ vars.JWT_PREVIOUS_KEY_ID }}
+          JWT_KEY_FINGERPRINTS_JSON: ${{ vars.JWT_KEY_FINGERPRINTS_JSON }}
+          GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE || 'cobroup-prod' }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          SSH_HOST_ED25519_FINGERPRINT: ${{ vars.SSH_HOST_ED25519_FINGERPRINT }}
+        run: |
+          bash scripts/deploy_remote.sh

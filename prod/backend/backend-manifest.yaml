@@ -13,7 +13,6 @@ data:
   DOTNET_RUNNING_IN_CONTAINER: "true"
   Identity__Issuer: "https://auth.cobroup.com"
   Identity__Audience: "cobroup-api"
-  Jwt__ActiveKeyId: "k1"
   AdministrativeApi__BaseUrl: "http://admin-backend:8080"
   Storage__Provider: "FileSystem"
   Storage__EvidencePath: "/var/cobroup/evidences"
@@ -32,6 +31,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany
+  storageClassName: standard
   resources:
     requests:
       storage: 10Gi
@@ -65,12 +65,22 @@ spec:
         environment: prod
     spec:
       securityContext:
-        fsGroup: 1000
+        runAsNonRoot: true
         runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       imagePullSecrets:
         - name: ghcr-secret
       containers:
         - name: backend
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
           image: ghcr.io/clepineuxp/ms-cobroup-backend:latest
           imagePullPolicy: Always
           ports:
@@ -82,6 +92,8 @@ spec:
                 name: backend-config
             - secretRef:
                 name: backend-secret
+            - secretRef:
+                name: jwt-signing-secret
           volumeMounts:
             - name: backend-evidence-volume
               mountPath: /var/cobroup/evidences

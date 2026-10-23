@@ -13,7 +13,6 @@ data:
   DOTNET_RUNNING_IN_CONTAINER: "true"
   Identity__Issuer: "https://qa-auth.cobroup.com"
   Identity__Audience: "cobroup-api"
-  Jwt__ActiveKeyId: "k1"
   OperationalApi__BaseUrl: "http://backend:8080"
   Logging__LogLevel__Default: "Information"
   Logging__LogLevel__Microsoft.AspNetCore: "Warning"
@@ -46,10 +45,23 @@ spec:
         app.kubernetes.io/part-of: cobroup
         environment: qa
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       imagePullSecrets:
         - name: ghcr-secret
       containers:
         - name: admin-backend
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
           image: ghcr.io/clepineuxp/ms-cobroup-backendadmin:qa
           imagePullPolicy: Always
           ports:
@@ -61,6 +73,8 @@ spec:
                 name: admin-backend-config
             - secretRef:
                 name: admin-backend-secret
+            - secretRef:
+                name: jwt-signing-secret
           resources:
             requests:
               cpu: 100m
