@@ -13,7 +13,7 @@ data:
   DOTNET_RUNNING_IN_CONTAINER: "true"
   Identity__Issuer: "https://auth.cobroup.com"
   Identity__Audience: "cobroup-api"
-  Jwt__SigningProvider: "PersistentRsa"
+  Jwt__ActiveKeyId: "k1"
   OperationalApi__BaseUrl: "http://backend:8080"
   Logging__LogLevel__Default: "Information"
   Logging__LogLevel__Microsoft.AspNetCore: "Warning"

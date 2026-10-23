@@ -79,3 +79,20 @@ Este documento registra cronológicamente las intervenciones y decisiones realiz
   - `scripts/test_render_manifests.py`: Agregada prueba negativa `test_dev_fails_when_rolling_update_overlaps_ephemeral_rsa` (10/10 pruebas en verde).
   - `kubectl kustomize dev`: Validado y confirmado `strategy: type: Recreate` con 0 errores.
 - **Git**: Cambios preservados en working tree sobre rama `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.
+
+### 2026-10-22 / 2026-10-23 — Migración integral a JWT simétrico HS256 por ambiente (GitOps)
+
+- **Decisión aplicada**: `cobroup.md/DECISION_AUTENTICACION_JWT.md`, `MS.Cobroup.BackendAdmin/docs/decisions/0007-symmetric-hs256-per-environment.md` y `MS.Cobroup.Backend/docs/decisions/0005-symmetric-hs256-validation.md`.
+- **Modificaciones técnicas**:
+  - **Secretos Kubernetes actualizados**: `dev/admin-backend/secret.yaml`, `dev/backend/secret.yaml`, `qa/admin-backend/secret.yaml`, `qa/backend/secret.yaml`, `prod/admin-backend/secret.yaml` y `prod/backend/secret.yaml` ahora inyectan `Jwt__SigningKeyBase64` consumiendo `${{Dev_Jwt__SigningKeyBase64}}`, `${{Qa_Jwt__SigningKeyBase64}}` y `${{Prod_Jwt__SigningKeyBase64}}`.
+  - **Aislamiento de Frontends**: Se verificó y garantizó que los frontends (`frontend`, `admin-frontend`) no reciben ni contienen material de secretos JWT.
+  - **ConfigMaps actualizados**: Se eliminaron `Jwt__SigningProvider: "EphemeralRsa"`, `Jwt__SigningProvider: "PersistentRsa"`, `Jwt__AllowEphemeralSigning: "true"` e `Identity__JwksUri`. Se configuró `Jwt__ActiveKeyId: "k1"`.
+  - **Estrategia de Despliegue**: Al ser el secreto simétrico idéntico entre réplicas mediante Kubernetes Secrets, se restauró `RollingUpdate` (`maxSurge: 1, maxUnavailable: 0`) eliminando la necesidad de `Recreate`.
+  - **Workflows CI/CD**: Actualizados `deploy-dev.yml`, `deploy-qa.yml` y `deploy-prod.yml` para consumir los GitHub Secrets `DEV_JWT_SIGNING_KEY_BASE64`, `QA_JWT_SIGNING_KEY_BASE64` y `PROD_JWT_SIGNING_KEY_BASE64`.
+  - **Renderer (`scripts/render_manifests.py`)**:
+    - Validación criptográfica fail-fast: no vacío, sin placeholders, Base64 válido, >= 32 bytes (256 bits).
+    - Detección de reutilización entre ambientes: falla críticamente si Dev, QA o Prod comparten el mismo valor de clave.
+    - Rechazo estricto de residuos heredados: `PrivateKeyPem`, `PublicKeyPem`, `EphemeralRsa`, `PersistentRsa`, `JwksUri`, `JwksUrl`, `AllowEphemeralSigning`, `AcknowledgeNonProductionEphemeralRiskOutsideDevelopment`, `SigningProvider`.
+    - Eliminado el gate de detención previa que bloqueaba despliegues por falta de proveedor persistente.
+  - **Pruebas automatizadas (`scripts/test_render_manifests.py`)**: 16/16 pruebas en verde, cubriendo casos positivos y negativos (falta de clave, vacía, placeholder, base64 inválido, 31 bytes, 32 bytes, colisión entre ambientes, residuos legacy, aislamiento frontend y validación kustomize en dev, qa y prod).
+- **Git**: Cambios preservados en working tree; sin commit, push, merge, tag ni PR.

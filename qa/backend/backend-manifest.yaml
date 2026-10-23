@@ -13,7 +13,7 @@ data:
   DOTNET_RUNNING_IN_CONTAINER: "true"
   Identity__Issuer: "https://qa-auth.cobroup.com"
   Identity__Audience: "cobroup-api"
-  Identity__JwksUri: "http://admin-backend:8080/api/v1/auth/.well-known/jwks.json"
+  Jwt__ActiveKeyId: "k1"
   AdministrativeApi__BaseUrl: "http://admin-backend:8080"
   Storage__Provider: "FileSystem"
   Storage__EvidencePath: "/var/cobroup/evidences"

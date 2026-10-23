@@ -3,11 +3,12 @@
 render_manifests.py - Renderiza y valida de manera segura y reproducible
 los manifiestos de Kubernetes de COBROUP para dev, qa y prod.
 
-Decisión de Seguridad JWT (2026-10-22):
-- En Development: Se utiliza EphemeralRsa explícito (en memoria, sin claves PEM externas).
-- En QA y Producción: EphemeralRsa está prohibido. Se requiere un proveedor persistente
-  (PersistentRsa/KMS), registrado como backlog obligatorio previo a producción.
-  El gate de despliegue detiene el pipeline antes de la transferencia SCP.
+Decisión de Seguridad JWT (2026-10-22 - DECISION_AUTENTICACION_JWT.md):
+- Algoritmo exclusivo: HS256 con secreto simétrico independiente por ambiente.
+- Secreto CSPRNG de mínimo 32 bytes (256 bits) transportado en Base64.
+- Inyección exclusiva en admin-backend y backend mediante Kubernetes Secrets.
+- Frontends completamente aislados del secreto criptográfico.
+- Prohibición estricta de RSA, PEM, JWKS, proveedores efímeros y acknowledge flags.
 
 Requisitos: PyYAML (declarado en scripts/requirements.txt)
 Uso: python render_manifests.py --env [dev|qa|prod] [--base-dir .] [--render-only]
@@ -35,26 +36,92 @@ ENV_CONFIGS = {
         "pvc_storage": "1Gi",
         "pvc_modes": ["ReadWriteOnce", "ReadWriteMany"],
         "required_mode": "ReadWriteOnce",
-        "allowed_signing_providers": ["EphemeralRsa"],
-        "requires_persistent_provider": False,
     },
     "qa": {
         "prefix": "QA_",
         "pvc_storage": "5Gi",
         "pvc_modes": ["ReadWriteOnce", "ReadWriteMany"],
         "required_mode": "ReadWriteOnce",
-        "allowed_signing_providers": ["PersistentRsa"],
-        "requires_persistent_provider": True,
     },
     "prod": {
         "prefix": "PROD_",
         "pvc_storage": "10Gi",
         "pvc_modes": ["ReadWriteMany"],
         "required_mode": "ReadWriteMany",
-        "allowed_signing_providers": ["PersistentRsa"],
-        "requires_persistent_provider": True,
     },
 }
+
+FORBIDDEN_LEGACY_PATTERNS = [
+    "PrivateKeyPem",
+    "PublicKeyPem",
+    "EphemeralRsa",
+    "PersistentRsa",
+    "JwksUri",
+    "JwksUrl",
+    "AllowEphemeralSigning",
+    "AcknowledgeNonProductionEphemeralRiskOutsideDevelopment",
+    "Jwt__SigningProvider",
+    "SigningProvider",
+]
+
+PLACEHOLDER_MARKERS = [
+    "CHANGE_ME",
+    "${{",
+    "PLACEHOLDER",
+    "DUMMY",
+    "TODO",
+    "YOUR_KEY",
+]
+
+
+def validate_base64_secret(env: str, secret_name: str, value: str) -> bytes:
+    """Valida que el secreto JWT cumpla con el estándar criptográfico CSPRNG Base64 >= 32 bytes."""
+    if not value or not value.strip():
+        sys.exit(f"ERROR: El secreto '{secret_name}' para el ambiente '{env}' está vacío o ausente.")
+
+    stripped = value.strip()
+    upper_val = stripped.upper()
+    for marker in PLACEHOLDER_MARKERS:
+        if marker in upper_val:
+            sys.exit(
+                f"ERROR: El secreto '{secret_name}' para el ambiente '{env}' contiene un placeholder o marcador inválido ('{marker}')."
+            )
+
+    try:
+        raw_bytes = base64.b64decode(stripped, validate=True)
+    except Exception as e:
+        sys.exit(
+            f"ERROR: El secreto '{secret_name}' para el ambiente '{env}' no es una cadena Base64 válida: {e}"
+        )
+
+    if len(raw_bytes) < 32:
+        sys.exit(
+            f"ERROR CRIPTO: El secreto '{secret_name}' para '{env}' decodifica a {len(raw_bytes)} bytes. "
+            f"Se requieren mínimo 32 bytes (256 bits) para HMAC-SHA256."
+        )
+
+    return raw_bytes
+
+
+def detect_cross_environment_key_reuse() -> None:
+    """Verifica que ningún ambiente comparta el mismo secreto JWT cuando múltiples variables están presentes."""
+    env_keys = {
+        "dev": os.environ.get("DEV_JWT_SIGNING_KEY_BASE64", "").strip(),
+        "qa": os.environ.get("QA_JWT_SIGNING_KEY_BASE64", "").strip(),
+        "prod": os.environ.get("PROD_JWT_SIGNING_KEY_BASE64", "").strip(),
+    }
+
+    env_names = list(env_keys.keys())
+    for i in range(len(env_names)):
+        for j in range(i + 1, len(env_names)):
+            env_a, env_b = env_names[i], env_names[j]
+            key_a, key_b = env_keys[env_a], env_keys[env_b]
+            if key_a and key_b and key_a == key_b:
+                sys.exit(
+                    f"ERROR CRITICO DE SEGURIDAD: Reutilización de clave detectada entre ambientes: "
+                    f"'{env_a}' y '{env_b}' tienen exactamente el mismo valor de secreto JWT. "
+                    f"Cada ambiente DEBE disponer de una clave CSPRNG independiente."
+                )
 
 
 def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -> None:
@@ -68,18 +135,27 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
     if not os.path.isdir(env_dir):
         sys.exit(f"ERROR: No se encontró el directorio de manifiestos: {env_dir}")
 
-    # 1. Validar variables requeridas de base de datos
+    # 1. Validar variables requeridas de entorno
     ops_db = os.environ.get(f"{prefix}OPERATIONSDATABASE_CONNECTIONSTRING", "").strip()
     ident_db = os.environ.get(f"{prefix}IDENTITYDATABASE_CONNECTIONSTRING", "").strip()
+    jwt_key = os.environ.get(f"{prefix}JWT_SIGNING_KEY_BASE64", "").strip()
 
     missing_vars = []
     if not ops_db:
         missing_vars.append(f"{prefix}OPERATIONSDATABASE_CONNECTIONSTRING")
     if not ident_db:
         missing_vars.append(f"{prefix}IDENTITYDATABASE_CONNECTIONSTRING")
+    if not jwt_key:
+        missing_vars.append(f"{prefix}JWT_SIGNING_KEY_BASE64")
 
     if missing_vars:
         sys.exit(f"ERROR: Faltan variables requeridas para el ambiente '{env}': {', '.join(missing_vars)}")
+
+    # Validar formato y longitud criptográfica de la clave JWT
+    validate_base64_secret(env, f"{prefix}JWT_SIGNING_KEY_BASE64", jwt_key)
+
+    # Detectar reutilización cruzada de claves entre ambientes
+    detect_cross_environment_key_reuse()
 
     # 2. Mapa de sustitución exacta para placeholders ${{...}}
     p_open = "${" + "{"
@@ -89,6 +165,7 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
     replacements = {
         f"{p_open}{title_prefix}OperationsDatabase__ConnectionString{p_close}": ops_db,
         f"{p_open}{title_prefix}IdentityDatabase__ConnectionString{p_close}": ident_db,
+        f"{p_open}{title_prefix}Jwt__SigningKeyBase64{p_close}": jwt_key,
     }
 
     ghcr_user = os.environ.get("GHCR_USERNAME", "").strip()
@@ -112,7 +189,11 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
                     if placeholder in modified:
                         modified = modified.replace(placeholder, val)
                         placeholder_name = placeholder.strip("${}")
-                        print(f"[OK] Sustituido '{placeholder_name}' en {os.path.relpath(filepath, base_dir)}")
+                        # Sanitize logging: NEVER log secret values
+                        if "Jwt" in placeholder_name or "Secret" in placeholder_name or "Key" in placeholder_name:
+                            print(f"[OK] Sustituido '{placeholder_name}' (redactado) en {os.path.relpath(filepath, base_dir)}")
+                        else:
+                            print(f"[OK] Sustituido '{placeholder_name}' en {os.path.relpath(filepath, base_dir)}")
 
                 if file == "ghcr-secret.yaml" and ghcr_user and ghcr_token:
                     auth_b64 = base64.b64encode(f"{ghcr_user}:{ghcr_token}".encode("utf-8")).decode("utf-8")
@@ -126,17 +207,24 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
                         f.write(modified)
                     substituted_files.append(filepath)
 
-    # 4. Validar ausencia de placeholders no resueltos y que no existan residuos de PEM
+    # 4. Validar ausencia de placeholders no resueltos y rechazo estricto de términos RSA/JWKS/PEM/Acknowledge
     unresolved = []
     for filepath in all_yaml_files:
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
         if p_open in content:
             unresolved.append(f"{os.path.relpath(filepath, base_dir)} (placeholders sin resolver)")
-        if "PrivateKeyPem" in content:
-            unresolved.append(f"{os.path.relpath(filepath, base_dir)} (residuo de clave PEM no permitido)")
+        for forbidden in FORBIDDEN_LEGACY_PATTERNS:
+            if forbidden in content:
+                unresolved.append(f"{os.path.relpath(filepath, base_dir)} (residuo no permitido: {forbidden})")
         if "CHANGE_ME" in content and not (ghcr_user and ghcr_token):
             unresolved.append(f"{os.path.relpath(filepath, base_dir)} (credenciales GHCR pendientes)")
+
+        # Validar aislamiento de Frontend: NINGUN frontend debe contener la clave JWT
+        rel_path = os.path.relpath(filepath, base_dir).replace("\\", "/")
+        if "frontend" in rel_path and not "admin-backend" in rel_path and not "backend" in rel_path:
+            if "Jwt__SigningKeyBase64" in content or (jwt_key and jwt_key in content):
+                unresolved.append(f"{rel_path} (VIOLACION CRITICA: la clave JWT no debe inyectarse en frontends)")
 
     if unresolved:
         sys.exit(f"ERROR: Placeholders o residuos pendientes de saneamiento en:\n  - " + "\n  - ".join(unresolved))
@@ -163,6 +251,7 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
     volume_found = False
     storage_provider_ok = False
     evidence_path_ok = False
+    backend_active_kid_ok = False
 
     for doc in docs:
         if not doc:
@@ -203,6 +292,8 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
                 storage_provider_ok = True
             if data.get("Storage__EvidencePath") == "/var/cobroup/evidences":
                 evidence_path_ok = True
+            if data.get("Jwt__ActiveKeyId"):
+                backend_active_kid_ok = True
 
     if not pvc_found:
         sys.exit(f"ERROR: PersistentVolumeClaim 'backend-evidence-pvc' no encontrado en {backend_manifest}")
@@ -212,10 +303,12 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
         sys.exit(f"ERROR: VolumeMount '/var/cobroup/evidences' no encontrado en el contenedor backend")
     if not (storage_provider_ok and evidence_path_ok):
         sys.exit(f"ERROR: ConfigMap 'backend-config' no configura Storage__Provider o Storage__EvidencePath correctamente")
+    if not backend_active_kid_ok:
+        sys.exit(f"ERROR: ConfigMap 'backend-config' no configura 'Jwt__ActiveKeyId'")
 
     print("[OK] Verificación de almacenamiento durable completada exitosamente.")
 
-    # 7. Validar configuración del proveedor de firma JWT de BackendAdmin
+    # 7. Validar configuración simétrica HS256 de BackendAdmin
     admin_backend_manifest = os.path.join(env_dir, "admin-backend", "admin-backend-manifest.yaml")
     if not os.path.isfile(admin_backend_manifest):
         sys.exit(f"ERROR: Falta el manifiesto de administración {admin_backend_manifest}")
@@ -223,8 +316,7 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
     with open(admin_backend_manifest, "r", encoding="utf-8") as f:
         admin_docs = list(yaml.safe_load_all(f))
 
-    signing_provider = None
-    allow_ephemeral = None
+    admin_active_kid_ok = False
     admin_deployment = None
 
     for doc in admin_docs:
@@ -232,51 +324,26 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
             continue
         if doc.get("kind") == "ConfigMap" and doc.get("metadata", {}).get("name") == "admin-backend-config":
             data = doc.get("data", {})
-            signing_provider = data.get("Jwt__SigningProvider")
-            allow_ephemeral = data.get("Jwt__AllowEphemeralSigning")
+            if data.get("Jwt__ActiveKeyId"):
+                admin_active_kid_ok = True
         elif doc.get("kind") == "Deployment" and doc.get("metadata", {}).get("name") == "admin-backend":
             admin_deployment = doc
 
-    if not signing_provider:
-        sys.exit(f"ERROR: ConfigMap 'admin-backend-config' debe especificar 'Jwt__SigningProvider'.")
+    if not admin_active_kid_ok:
+        sys.exit(f"ERROR: ConfigMap 'admin-backend-config' debe especificar 'Jwt__ActiveKeyId'.")
     if not admin_deployment:
         sys.exit(f"ERROR: Deployment 'admin-backend' no encontrado en {admin_backend_manifest}")
 
-    if env == "dev":
-        if signing_provider != "EphemeralRsa" or allow_ephemeral != "true":
-            sys.exit(
-                f"ERROR en dev: 'Jwt__SigningProvider' debe ser 'EphemeralRsa' y 'Jwt__AllowEphemeralSigning' debe ser 'true'."
-            )
+    # Verificar que el secreto admin-backend-secret y backend-secret contengan Jwt__SigningKeyBase64
+    for svc_name in ["admin-backend", "backend"]:
+        sec_path = os.path.join(env_dir, svc_name, "secret.yaml")
+        with open(sec_path, "r", encoding="utf-8") as f:
+            sec_doc = yaml.safe_load(f)
+        str_data = sec_doc.get("stringData", {})
+        if "Jwt__SigningKeyBase64" not in str_data or not str_data["Jwt__SigningKeyBase64"]:
+            sys.exit(f"ERROR: {svc_name}/secret.yaml no contiene 'Jwt__SigningKeyBase64' resuelto.")
 
-        # Validación B-19: Mientras la clave sea efímera, el rollout no debe superponer dos pods emisores incompatibles
-        strategy = admin_deployment.get("spec", {}).get("strategy", {})
-        strategy_type = strategy.get("type")
-        if strategy_type == "RollingUpdate":
-            rolling_update = strategy.get("rollingUpdate", {})
-            max_surge = rolling_update.get("maxSurge", 1)
-            if max_surge != 0:
-                sys.exit(
-                    "ERROR DE SEGURIDAD (B-19): Con el proveedor 'EphemeralRsa', el Deployment 'admin-backend' "
-                    "no puede usar RollingUpdate con maxSurge > 0 porque provocaría la coexistencia de dos pods "
-                    "con claves efímeras divergentes y rechazo intermitente de tokens tras el Service.\n"
-                    "Configure 'strategy.type: Recreate' o un rollout que impida la superposición de réplicas."
-                )
-        elif strategy_type != "Recreate":
-            sys.exit(
-                f"ERROR DE SEGURIDAD (B-19): Con 'EphemeralRsa', la estrategia de despliegue de 'admin-backend' debe ser 'Recreate' "
-                f"(configurada actualmente como '{strategy_type}')."
-            )
-
-        print("[OK] Verificado modo EphemeralRsa con estrategia 'Recreate' (sin superposición de pods emisores, B-19).")
-    else:
-        # En QA y Producción: EphemeralRsa está estrictamente prohibido
-        if signing_provider == "EphemeralRsa":
-            sys.exit(
-                f"ERROR DE SEGURIDAD CRITICO en {env}: El proveedor 'EphemeralRsa' está estrictamente prohibido fuera de Development.\n"
-                f"Consulte la decisión arquitectónica vigente (DECISION_AUTENTICACION_JWT.md)."
-            )
-
-        print(f"[OK] Verificada restricción de firma para {env}: proveedor '{signing_provider}'.")
+    print(f"[OK] Verificada configuración simétrica HS256 consistente para admin-backend y backend en '{env}'.")
 
     # 8. Validar con kubectl kustomize si la herramienta está disponible
     kubectl_bin = shutil.which("kubectl")
@@ -288,20 +355,7 @@ def render_manifests(env: str, base_dir: str = ".", render_only: bool = False) -
     else:
         print("[INFO] 'kubectl' no encontrado en PATH. Omisión de renderizado kustomize local.")
 
-    # 9. Gate de despliegue para QA y Producción:
-    # Si el ambiente requiere proveedor persistente y no estamos en modo solo-render, detener antes de transferencia SCP.
-    if cfg["requires_persistent_provider"] and not render_only:
-        print(f"\n================================================================================")
-        print(f"GATE DE DESPLIEGUE - BLOQUEO OBLIGATORIO DE SEGURIDAD PREVIO A {env.upper()}:")
-        print(f"La solución tiene configurado '{signing_provider}' para {env}.")
-        print(f"Conforme a la decisión normativa del 2026-10-22, la integración de un proveedor")
-        print(f"persistente (AWS KMS, Kubernetes Secret o PFX) está pendiente como backlog obligatorio.")
-        print(f"El despliegue a {env} se detiene exitosamente ANTES de la transferencia al servidor.")
-        print(f"Consulte BACKLOG_SEGURIDAD_PRODUCTIVA.md para los criterios de salida a producción.")
-        print(f"================================================================================\n")
-        sys.exit(2)
-
-    print(f"\nRenderizado y validación de manifiestos para '{env}' completado con éxito.")
+    print(f"\nRenderizado y validación de manifiestos para '{env}' completado con éxito (HS256 per-environment).")
 
 
 def main():
@@ -311,7 +365,7 @@ def main():
     parser.add_argument(
         "--render-only",
         action="store_true",
-        help="Solo renderiza y valida estructura/kustomize sin activar el gate de detención de transferencia.",
+        help="Modo render-only.",
     )
     args = parser.parse_args()
 
