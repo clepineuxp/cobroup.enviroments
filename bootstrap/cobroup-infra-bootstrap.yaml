@@ -21,3 +21,15 @@ metadata:
   labels:
     app.kubernetes.io/part-of: cobroup
     environment: prod
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cobroup-rwx-storage
+  labels:
+    app.kubernetes.io/name: cobroup-rwx-storage
+    app.kubernetes.io/part-of: cobroup
+provisioner: rancher.io/local-path
+volumeBindingMode: Immediate
+reclaimPolicy: Retain
+allowVolumeExpansion: true

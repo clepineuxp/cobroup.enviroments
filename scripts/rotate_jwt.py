@@ -396,10 +396,11 @@ def execute_revocation_job(k8s: KubectlExecutor, namespace: str, arg: str, kid: 
 
     job_name = f"jwt-revocation-{int(datetime.now(timezone.utc).timestamp())}"
 
-    # El kid a revocar se inyecta como variable de entorno para evitar exposición en argumentos
+    # El kid a revocar se pasa como argumento de comando y en variable de entorno para compatibilidad total
     job_cmd = ["dotnet", "MS.Cobroup.BackendAdmin.Api.dll", arg]
     env_vars = []
     if kid:
+        job_cmd.append(kid)
         env_vars.append({"name": "JWT_REVOKE_KID", "value": kid})
 
     job_manifest = {

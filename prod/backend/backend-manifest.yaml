@@ -31,7 +31,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteMany
-  storageClassName: standard
+  storageClassName: cobroup-rwx-storage
   resources:
     requests:
       storage: 10Gi

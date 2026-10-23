@@ -320,6 +320,14 @@ class TestRotateJwt(unittest.TestCase):
             "El Job de revocación DEBE montar 'jwt-signing-secret' en envFrom para que SymmetricKeyService resuelva Jwt__SigningKeyBase64 y Jwt__ActiveKeyId",
         )
 
+        # Verificar comando y contrato de entrada unificado
+        cmd = container.get("command", [])
+        self.assertEqual(cmd, ["dotnet", "MS.Cobroup.BackendAdmin.Api.dll", "--revoke-kid", "k1"])
+
+        env = container.get("env", [])
+        env_dict = {e["name"]: e["value"] for e in env if "name" in e and "value" in e}
+        self.assertEqual(env_dict.get("JWT_REVOKE_KID"), "k1")
+
         # Verificar securityContext del Job
         sec_ctx = container.get("securityContext", {})
         self.assertFalse(sec_ctx.get("allowPrivilegeEscalation", True))
