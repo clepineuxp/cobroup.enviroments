@@ -16,14 +16,14 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - qa.cobroup.com
-        - qa-admin.cobroup.com
-        - qa-api.cobroup.com
-        - qa-auth.cobroup.com
+        - __INGRESS_FRONTEND_HOST__
+        - __INGRESS_ADMIN_FRONTEND_HOST__
+        - __INGRESS_API_HOST__
+        - __INGRESS_AUTH_HOST__
       secretName: cobroup-tls
   rules:
     # 1. PWA Recolector (Collector Frontend)
-    - host: qa.cobroup.com
+    - host: __INGRESS_FRONTEND_HOST__
       http:
         paths:
           - path: /api/operations
@@ -42,7 +42,7 @@ spec:
                   number: 8080
 
     # 2. Portal Administrativo (Admin Frontend)
-    - host: qa-admin.cobroup.com
+    - host: __INGRESS_ADMIN_FRONTEND_HOST__
       http:
         paths:
           - path: /api/operations
@@ -61,7 +61,7 @@ spec:
                   number: 8080
 
     # 3. Dedicated Operations API Domain
-    - host: qa-api.cobroup.com
+    - host: __INGRESS_API_HOST__
       http:
         paths:
           - path: /
@@ -73,7 +73,7 @@ spec:
                   number: 8080
 
     # 4. Dedicated Auth / Identity Domain
-    - host: qa-auth.cobroup.com
+    - host: __INGRESS_AUTH_HOST__
       http:
         paths:
           - path: /
@@ -104,11 +104,11 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - qa.cobroup.com
-        - qa-admin.cobroup.com
+        - __INGRESS_FRONTEND_HOST__
+        - __INGRESS_ADMIN_FRONTEND_HOST__
       secretName: cobroup-tls
   rules:
-    - host: qa.cobroup.com
+    - host: __INGRESS_FRONTEND_HOST__
       http:
         paths:
           - path: /identity(/|$)(.*)
@@ -118,7 +118,7 @@ spec:
                 name: admin-backend
                 port:
                   number: 8080
-    - host: qa-admin.cobroup.com
+    - host: __INGRESS_ADMIN_FRONTEND_HOST__
       http:
         paths:
           - path: /identity(/|$)(.*)

@@ -11,7 +11,7 @@ data:
   ASPNETCORE_ENVIRONMENT: "Staging"
   ASPNETCORE_URLS: "http://+:8080"
   DOTNET_RUNNING_IN_CONTAINER: "true"
-  Identity__Issuer: "https://qa-auth.cobroup.com"
+  Identity__Issuer: "https://__INGRESS_AUTH_HOST__"
   Identity__Audience: "cobroup-api"
   OperationalApi__BaseUrl: "http://backend:8080"
   Logging__LogLevel__Default: "Information"

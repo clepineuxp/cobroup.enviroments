@@ -85,6 +85,19 @@ PLACEHOLDER_MARKERS = [
 ]
 
 KEY_ID_REGEX = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+HOSTNAME_REGEX = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+
+INGRESS_HOST_TOKENS = {
+    "INGRESS_FRONTEND_HOST": "__INGRESS_FRONTEND_HOST__",
+    "INGRESS_ADMIN_FRONTEND_HOST": "__INGRESS_ADMIN_FRONTEND_HOST__",
+    "INGRESS_API_HOST": "__INGRESS_API_HOST__",
+    "INGRESS_AUTH_HOST": "__INGRESS_AUTH_HOST__",
+}
+PROD_INGRESS_HOST_TOKENS = {
+    "INGRESS_FRONTEND_ALIAS_HOST": "__INGRESS_FRONTEND_ALIAS_HOST__",
+}
 
 
 def validate_key_id(kid_name: str, kid_value: str) -> str:
@@ -104,6 +117,66 @@ def validate_key_id(kid_name: str, kid_value: str) -> str:
         )
 
     return stripped
+
+
+def validate_hostname(variable_name: str, value: str) -> str:
+    """Valida un hostname DNS público sin esquema, puerto, ruta ni comodines."""
+    hostname = value.strip().lower()
+    if not hostname:
+        sys.exit(f"ERROR: La variable '{variable_name}' es obligatoria y no puede estar vacía.")
+    if not HOSTNAME_REGEX.fullmatch(hostname):
+        sys.exit(
+            f"ERROR: La variable '{variable_name}' debe contener únicamente un hostname DNS válido "
+            "(sin esquema, puerto, ruta ni wildcard)."
+        )
+    return hostname
+
+
+def render_environment_hosts(env: str, env_dir: str) -> dict[str, str]:
+    """Sustituye los hosts públicos en los YAML no sensibles usando variables del GitHub Environment."""
+    host_tokens = dict(INGRESS_HOST_TOKENS)
+    if env == "prod":
+        host_tokens.update(PROD_INGRESS_HOST_TOKENS)
+
+    hosts = {
+        variable_name: validate_hostname(variable_name, os.environ.get(variable_name, ""))
+        for variable_name in host_tokens
+    }
+    if len(set(hosts.values())) != len(hosts):
+        sys.exit(f"ERROR: Los hosts públicos configurados para '{env}' deben ser distintos entre sí.")
+
+    replacements = {
+        token: hosts[variable_name]
+        for variable_name, token in host_tokens.items()
+    }
+    replacement_counts = {token: 0 for token in replacements}
+
+    for root, _, files in os.walk(env_dir):
+        for filename in files:
+            if not filename.endswith((".yaml", ".yml")):
+                continue
+            filepath = os.path.join(root, filename)
+            with open(filepath, "r", encoding="utf-8") as manifest:
+                content = manifest.read()
+
+            rendered = content
+            for token, hostname in replacements.items():
+                count = rendered.count(token)
+                replacement_counts[token] += count
+                rendered = rendered.replace(token, hostname)
+
+            if rendered != content:
+                with open(filepath, "w", encoding="utf-8") as manifest:
+                    manifest.write(rendered)
+
+    missing_tokens = [token for token, count in replacement_counts.items() if count == 0]
+    if missing_tokens:
+        sys.exit(
+            f"ERROR: Las plantillas de '{env}' no contienen los tokens de host esperados: "
+            + ", ".join(missing_tokens)
+        )
+
+    return hosts
 
 
 def validate_base64_secret(env: str, secret_name: str, value: str) -> bytes:
@@ -389,9 +462,11 @@ def render_manifests(
         sys.stdout.write(emit_secrets_yaml(env, namespace))
         return
 
-    # 6. Actualizar manifiestos no sensibles en disco (ConfigMaps y PVC)
+    # 6. Renderizar hosts públicos y actualizar manifiestos no sensibles en disco
     if not os.path.isdir(env_dir):
         sys.exit(f"ERROR: No se encontró el directorio de manifiestos: {env_dir}")
+
+    ingress_hosts = render_environment_hosts(env, env_dir)
 
     # Verificar kustomization.yaml: REGLA B-22 - NO debe contener secret.yaml ni ghcr-secret.yaml
     kustomization_path = os.path.join(env_dir, "kustomization.yaml")
@@ -481,6 +556,9 @@ def render_manifests(
                     if marker in content:
                         sys.exit(f"ERROR: Placeholder '{marker}' no resuelto en {os.path.relpath(filepath, base_dir)}")
 
+                if "__INGRESS_" in content:
+                    sys.exit(f"ERROR: Token de host no resuelto en {os.path.relpath(filepath, base_dir)}")
+
                 for forbidden in FORBIDDEN_LEGACY_PATTERNS:
                     if forbidden in content:
                         sys.exit(f"ERROR: Residuo no permitido '{forbidden}' en {os.path.relpath(filepath, base_dir)}")
@@ -498,7 +576,30 @@ def render_manifests(
                     if "jwt-signing-secret" in content or "SigningKeyBase64" in content or jwt_active_b64 in content:
                         sys.exit(f"ERROR CRITICO: Clave o Secret JWT expuesto a frontend en {rel_path}")
 
-    # 8. Validar con kubectl kustomize si la herramienta está disponible
+    # 8. Verificar que todos y únicamente los hosts configurados estén presentes en el Ingress.
+    ingress_path = os.path.join(env_dir, "ingress.yaml")
+    with open(ingress_path, "r", encoding="utf-8") as ingress_file:
+        ingress_docs = [doc for doc in yaml.safe_load_all(ingress_file) if doc]
+
+    configured_hosts = set(ingress_hosts.values())
+    rendered_rule_hosts = {
+        rule.get("host")
+        for doc in ingress_docs
+        for rule in doc.get("spec", {}).get("rules", [])
+        if rule.get("host")
+    }
+    rendered_tls_hosts = {
+        host
+        for doc in ingress_docs
+        for tls_entry in doc.get("spec", {}).get("tls", [])
+        for host in tls_entry.get("hosts", [])
+    }
+    if rendered_rule_hosts != configured_hosts or rendered_tls_hosts != configured_hosts:
+        sys.exit(
+            f"ERROR: Los hosts renderizados en ingress.yaml para '{env}' no coinciden exactamente con las variables del GitHub Environment."
+        )
+
+    # 9. Validar con kubectl kustomize si la herramienta está disponible
     kubectl_bin = shutil.which("kubectl")
     if kubectl_bin:
         res = subprocess.run([kubectl_bin, "kustomize", env_dir], capture_output=True, text=True)

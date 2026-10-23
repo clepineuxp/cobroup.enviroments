@@ -21,6 +21,7 @@ Valida:
 8. Validación de almacenamiento durable PVC (RWO en dev/qa, RWX en prod, StorageClass requerida en qa/prod).
 9. Aislamiento total de Frontends frente a secretos de backend y JWT.
 10. Rechazo de residuos RSA, PEM, JWKS y flags efímeros.
+11. Renderizado y validación estricta de hosts desde variables de GitHub Environments.
 """
 
 import base64
@@ -39,6 +40,7 @@ from render_manifests import (
     validate_base64_secret,
     validate_key_id,
     validate_fingerprints_json,
+    validate_hostname,
     emit_secrets_yaml,
 )
 
@@ -75,6 +77,11 @@ class TestRenderManifests(unittest.TestCase):
         os.environ["GHCR_USERNAME"] = "testuser"
         os.environ["GHCR_TOKEN"] = "testtoken"
         os.environ["PVC_STORAGE_CLASS"] = "standard"
+        os.environ["INGRESS_FRONTEND_HOST"] = "dev.cobroup.com"
+        os.environ["INGRESS_ADMIN_FRONTEND_HOST"] = "dev-admin.cobroup.com"
+        os.environ["INGRESS_API_HOST"] = "dev-api.cobroup.com"
+        os.environ["INGRESS_AUTH_HOST"] = "dev-auth.cobroup.com"
+        os.environ["INGRESS_FRONTEND_ALIAS_HOST"] = "www.cobroup.com"
 
     def tearDown(self):
         os.environ.clear()
@@ -106,6 +113,25 @@ class TestRenderManifests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             validate_key_id("TEST_KID", "invalid kid with spaces")
         self.assertIn("formato requerido", str(ctx.exception))
+
+    def test_hostname_validation_strict(self):
+        self.assertEqual(
+            "dev-api.cobroup.com",
+            validate_hostname("INGRESS_API_HOST", "DEV-API.COBROUP.COM"),
+        )
+
+        for invalid_hostname in ["", "https://dev.cobroup.com", "dev.cobroup.com/path", "*.cobroup.com"]:
+            with self.subTest(hostname=invalid_hostname), self.assertRaises(SystemExit):
+                validate_hostname("INGRESS_FRONTEND_HOST", invalid_hostname)
+
+    def test_missing_ingress_host_variable_fails_fast(self):
+        del os.environ["INGRESS_AUTH_HOST"]
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            shutil.copytree(os.path.join(repo_root, "dev"), os.path.join(tmp_dir, "dev"))
+            with self.assertRaises(SystemExit) as ctx:
+                render_manifests("dev", base_dir=tmp_dir)
+            self.assertIn("INGRESS_AUTH_HOST", str(ctx.exception))
 
     def test_jwt_key_crypto_validation(self):
         # Vacío
@@ -285,12 +311,37 @@ class TestRenderManifests(unittest.TestCase):
             tmp_dev = os.path.join(tmp_dir, "dev")
             shutil.copytree(os.path.join(repo_root, "dev"), tmp_dev)
             render_manifests("dev", base_dir=tmp_dir)
+            with open(os.path.join(tmp_dev, "ingress.yaml"), "r", encoding="utf-8") as ingress_file:
+                ingress_docs = [doc for doc in yaml.safe_load_all(ingress_file) if doc]
+            dev_hosts = {
+                rule["host"]
+                for doc in ingress_docs
+                for rule in doc.get("spec", {}).get("rules", [])
+            }
+            self.assertEqual(
+                {
+                    "dev.cobroup.com",
+                    "dev-admin.cobroup.com",
+                    "dev-api.cobroup.com",
+                    "dev-auth.cobroup.com",
+                },
+                dev_hosts,
+            )
+            with open(os.path.join(tmp_dev, "frontend", "frontend-manifest.yaml"), "r", encoding="utf-8") as frontend_file:
+                frontend_rendered = frontend_file.read()
+            self.assertIn("https://dev-api.cobroup.com", frontend_rendered)
+            self.assertIn("https://dev-auth.cobroup.com", frontend_rendered)
+            self.assertNotIn("__INGRESS_", frontend_rendered)
 
         # QA
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_qa = os.path.join(tmp_dir, "qa")
             shutil.copytree(os.path.join(repo_root, "qa"), tmp_qa)
             os.environ["JWT_ACTIVE_SIGNING_KEY_BASE64"] = self.valid_qa_key
+            os.environ["INGRESS_FRONTEND_HOST"] = "qa.cobroup.com"
+            os.environ["INGRESS_ADMIN_FRONTEND_HOST"] = "qa-admin.cobroup.com"
+            os.environ["INGRESS_API_HOST"] = "qa-api.cobroup.com"
+            os.environ["INGRESS_AUTH_HOST"] = "qa-auth.cobroup.com"
             render_manifests("qa", base_dir=tmp_dir)
 
         # Prod
@@ -298,6 +349,11 @@ class TestRenderManifests(unittest.TestCase):
             tmp_prod = os.path.join(tmp_dir, "prod")
             shutil.copytree(os.path.join(repo_root, "prod"), tmp_prod)
             os.environ["JWT_ACTIVE_SIGNING_KEY_BASE64"] = self.valid_prod_key
+            os.environ["INGRESS_FRONTEND_HOST"] = "cobroup.com"
+            os.environ["INGRESS_FRONTEND_ALIAS_HOST"] = "www.cobroup.com"
+            os.environ["INGRESS_ADMIN_FRONTEND_HOST"] = "admin.cobroup.com"
+            os.environ["INGRESS_API_HOST"] = "api.cobroup.com"
+            os.environ["INGRESS_AUTH_HOST"] = "auth.cobroup.com"
             render_manifests("prod", base_dir=tmp_dir)
 
     def test_jwt_secret_structure_stable_vs_overlap(self):

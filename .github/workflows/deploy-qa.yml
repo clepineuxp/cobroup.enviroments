@@ -20,6 +20,11 @@ jobs:
     name: Deploy QA Manifests to Remote Cluster
     runs-on: ubuntu-latest
     environment: qa
+    env:
+      INGRESS_FRONTEND_HOST: ${{ vars.INGRESS_FRONTEND_HOST }}
+      INGRESS_ADMIN_FRONTEND_HOST: ${{ vars.INGRESS_ADMIN_FRONTEND_HOST }}
+      INGRESS_API_HOST: ${{ vars.INGRESS_API_HOST }}
+      INGRESS_AUTH_HOST: ${{ vars.INGRESS_AUTH_HOST }}
 
     steps:
       - name: 1. Checkout Repository

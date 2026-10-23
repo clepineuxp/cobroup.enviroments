@@ -96,6 +96,7 @@ Este documento registra cronológicamente las intervenciones y decisiones realiz
     - Eliminado el gate de detención previa que bloqueaba despliegues por falta de proveedor persistente.
   - **Pruebas automatizadas (`scripts/test_render_manifests.py`)**: 16/16 pruebas en verde, cubriendo casos positivos y negativos (falta de clave, vacía, placeholder, base64 inválido, 31 bytes, 32 bytes, colisión entre ambientes, residuos legacy, aislamiento frontend y validación kustomize en dev, qa y prod).
 - **Git**: Cambios preservados en working tree; sin commit, push, merge, tag ni PR.
+
 ### 2026-10-23 — Remediación obligatoria de hallazgos B-21 y B-23 (GitOps, Workflows y Orquestación)
 
 - **Auditoría atendida**: `cobroup.md/informe/auditoria-backend-csharp-2026-10-23-v10.html` (Hallazgos B-21 y B-23).
@@ -127,3 +128,17 @@ Este documento registra cronológicamente las intervenciones y decisiones realiz
   - `scripts/test_rotate_jwt.py`: 10 pruebas (máquina de estados, orden de rollout, rollback en memoria, tiempo mínimo de retiro, Job de revocación).
   - Total: 35/35 pruebas en verde en `cobroup.environments`.
 - **Git**: Cambios preservados en working tree; sin commit, push, merge, tag ni PR.
+
+### 2026-10-23 — Hosts de Ingress administrados por GitHub Environments
+
+- **Solicitud**: Retirar los dominios públicos hardcodeados de los manifiestos y obtenerlos desde variables configuradas por ambiente en GitHub Actions, además de documentar el inventario completo de variables y secretos.
+- **Implementación**:
+  - Los workflows `deploy-dev.yml`, `deploy-qa.yml` y `deploy-prod.yml` exportan `INGRESS_FRONTEND_HOST`, `INGRESS_ADMIN_FRONTEND_HOST`, `INGRESS_API_HOST` e `INGRESS_AUTH_HOST` desde `vars`; Prod agrega `INGRESS_FRONTEND_ALIAS_HOST` para `www.cobroup.com`.
+  - Los manifiestos de `dev`, `qa` y `prod` usan tokens no sensibles para todos los hosts del Ingress, `API_URL`, `IDENTITY_URL` e `Identity__Issuer`.
+  - `scripts/render_manifests.py` exige y valida hostnames DNS, rechaza duplicados, sustituye los tokens y comprueba que los hosts de `rules` y `tls` coincidan exactamente con las variables del GitHub Environment.
+  - `README.md` documenta los Environments `dev`, `qa` y `prod`, la matriz de hosts y el inventario completo de Environment Secrets y Environment Variables, incluyendo los campos opcionales y los usados exclusivamente durante rotación JWT.
+- **Pruebas**:
+  - `scripts/test_render_manifests.py`: 19/19 pruebas en verde, incluidas validación DNS, variable ausente, render de hosts y coherencia de URLs públicas.
+  - Suite completa de `scripts`: 48/48 pruebas en verde.
+  - `kubectl kustomize` validó satisfactoriamente `dev`, `qa` y `prod` después del render.
+- **Git**: Cambios preservados en working tree sobre `feature/diferir-pem-rsa-efimero`; sin commit, push, merge, tag ni PR.

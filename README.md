@@ -46,7 +46,7 @@ Las imágenes de contenedor se construyen y publican en **GitHub Container Regis
 ### Contrato de identidad vigente
 
 COBROUP usa exclusivamente JWT firmados con `HS256` según `../cobroup.md/DECISION_AUTENTICACION_JWT.md`. Esta regla reemplaza definitivamente RSA, PEM/PFX, JWKS, proveedores efímeros/persistentes y banderas de acknowledge.
-- Cada ambiente usa un secreto CSPRNG Base64 distinto, de 32 bytes o más: `DEV_JWT_SIGNING_KEY_BASE64`, `QA_JWT_SIGNING_KEY_BASE64` y `PROD_JWT_SIGNING_KEY_BASE64`.
+- Cada GitHub Environment usa un valor distinto para el secret `JWT_ACTIVE_SIGNING_KEY_BASE64`: CSPRNG en Base64 de 32 bytes o más.
 - Dentro de un ambiente, el mismo valor se inyecta como `Jwt__SigningKeyBase64` exclusivamente en `admin-backend` (emite y valida) y `backend` (solo valida). Los frontends y otras cargas no reciben el Secret.
 - Los valores reales viven en GitHub Environment Secrets/Kubernetes Secrets. Está prohibido escribirlos en Git, ConfigMap, imagen, logs, artefactos o archivos renderizados persistentes.
 - El render y el arranque deben fallar ante secreto ausente, placeholder, Base64 inválido, menos de 32 bytes o configuración de algoritmo distinta de `HS256`. No existen valores predeterminados ni fallback.
@@ -103,30 +103,62 @@ git push -u origin dev
 git push -u origin qa
 ```
 
-### Paso 2: Crear el Entorno `cobroup`
-En **Settings ➔ Environments ➔ New environment**: crear el entorno `cobroup`.
+### Paso 2: Crear los GitHub Environments
 
-### Paso 3: Cargar Secretos (Secrets)
-En **Settings ➔ Secrets and variables ➔ Actions**:
-- `SSH_HOST`: IP pública de la VPS.
-- `SSH_USER`: `deployer`.
-- `SSH_KEY`: Clave privada SSH Ed25519.
-- `SSH_PORT`: `22`.
-- `GHCR_TOKEN`: PAT clásico de GitHub con scope `read:packages`.
-- `DEV_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en dev.
-- `DEV_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en dev.
-- `QA_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en qa.
-- `QA_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en qa.
-- `PROD_OPERATIONSDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL operations en prod.
-- `PROD_IDENTITYDATABASE_CONNECTIONSTRING`: Cadena PostgreSQL identity en prod.
-- `DEV_JWT_SIGNING_KEY_BASE64`: secreto HS256 CSPRNG exclusivo de Dev, Base64 de 32 bytes o más.
-- `QA_JWT_SIGNING_KEY_BASE64`: secreto HS256 CSPRNG exclusivo de QA, Base64 de 32 bytes o más.
-- `PROD_JWT_SIGNING_KEY_BASE64`: secreto HS256 CSPRNG exclusivo de Prod, Base64 de 32 bytes o más.
+En **Settings ➔ Environments ➔ New environment** crear, con estos nombres exactos:
 
-*(Nota: los nombres RSA/PEM anteriores fueron retirados y no deben reintroducirse. Los secretos HS256 reales nunca se escriben en el repositorio.)*
+- `dev`
+- `qa`
+- `prod`
 
-### Paso 4: Cargar Variables
-- `GHCR_USERNAME`: `clepineuxp`.
+Los tres workflows de despliegue seleccionan explícitamente su Environment. Por ello se usan los mismos nombres de variables y secretos en los tres, pero cada Environment conserva sus propios valores.
+
+### Paso 3: Crear los Environment Secrets
+
+Crear estos secretos dentro de **cada** Environment (`dev`, `qa` y `prod`):
+
+| Secret | Obligatorio | Contenido |
+|---|---:|---|
+| `OPERATIONS_DATABASE_CONNECTIONSTRING` | Sí | Cadena de conexión de Operations para ese ambiente. |
+| `IDENTITY_DATABASE_CONNECTIONSTRING` | Sí | Cadena de conexión de Identity para ese ambiente. |
+| `JWT_ACTIVE_SIGNING_KEY_BASE64` | Sí | Clave HS256 CSPRNG exclusiva del ambiente, Base64 válido de al menos 32 bytes. |
+| `JWT_PREVIOUS_SIGNING_KEY_BASE64` | Solo durante rotación | Clave anterior. Debe existir junto con `JWT_PREVIOUS_KEY_ID`; en estado estable debe estar ausente. |
+| `SSH_KEY` | Sí | Clave privada SSH usada por el runner para desplegar. |
+| `SSH_HOST` | Sí | IP o hostname del servidor SSH. |
+| `SSH_USER` | Sí | Usuario remoto, por ejemplo `deployer`. |
+| `SSH_PORT` | No | Puerto SSH. Si no existe, se usa `22`. |
+| `GHCR_TOKEN` | Condicional | PAT con `read:packages` cuando `GITHUB_TOKEN` no pueda leer las imágenes privadas de los otros repositorios. |
+
+`GITHUB_TOKEN` no se crea manualmente: GitHub Actions lo suministra automáticamente. Los nombres RSA/PEM anteriores fueron retirados y no deben reintroducirse.
+
+### Paso 4: Crear las Environment Variables
+
+Crear estas variables dentro de **cada** Environment:
+
+| Variable | Obligatoria | Contenido |
+|---|---:|---|
+| `INGRESS_FRONTEND_HOST` | Sí | Host principal de la PWA, sin `https://`, puerto ni ruta. |
+| `INGRESS_ADMIN_FRONTEND_HOST` | Sí | Host del portal administrativo. |
+| `INGRESS_API_HOST` | Sí | Host público de Operations API. |
+| `INGRESS_AUTH_HOST` | Sí | Host público de Identity/Auth. |
+| `INGRESS_FRONTEND_ALIAS_HOST` | Solo `prod` | Alias público adicional del frontend (`www.cobroup.com`). No se crea en `dev` ni `qa`. |
+| `JWT_ACTIVE_KEY_ID` | Sí | Identificador de la clave activa, por ejemplo `k1`. |
+| `JWT_PREVIOUS_KEY_ID` | Solo durante rotación | Identificador anterior. Debe existir junto con `JWT_PREVIOUS_SIGNING_KEY_BASE64`; en estado estable debe estar ausente. |
+| `JWT_KEY_FINGERPRINTS_JSON` | Sí | JSON con los SHA-256 de las claves activas de los tres ambientes: `{"dev":"<64 hex>","qa":"<64 hex>","prod":"<64 hex>"}`. |
+| `SSH_HOST_ED25519_FINGERPRINT` | Sí | Huella fijada del host SSH en formato `SHA256:<base64>`. |
+| `PVC_STORAGE_CLASS` | Sí en `qa` y `prod` | StorageClass: RWO en QA y RWX en Prod. En Dev es opcional y el workflow usa `standard` por defecto. |
+| `KUBERNETES_NAMESPACE` | No | Si se crea, debe ser exactamente `cobroup-dev`, `cobroup-qa` o `cobroup-prod`. |
+| `GHCR_USERNAME` | No | Usuario/organización de GHCR; si falta, se usa `github.actor`. |
+
+Valores de host que deben configurarse actualmente:
+
+| Environment | `INGRESS_FRONTEND_HOST` | `INGRESS_ADMIN_FRONTEND_HOST` | `INGRESS_API_HOST` | `INGRESS_AUTH_HOST` | `INGRESS_FRONTEND_ALIAS_HOST` |
+|---|---|---|---|---|---|
+| `dev` | `dev.cobroup.com` | `dev-admin.cobroup.com` | `dev-api.cobroup.com` | `dev-auth.cobroup.com` | No crear |
+| `qa` | `qa.cobroup.com` | `qa-admin.cobroup.com` | `qa-api.cobroup.com` | `qa-auth.cobroup.com` | No crear |
+| `prod` | `cobroup.com` | `admin.cobroup.com` | `api.cobroup.com` | `auth.cobroup.com` | `www.cobroup.com` |
+
+El renderer valida que todos los hosts sean DNS válidos y distintos, sustituye los tokens de los manifiestos y comprueba que las reglas y certificados TLS del Ingress coincidan exactamente con las variables. `INGRESS_API_HOST` e `INGRESS_AUTH_HOST` también alimentan `API_URL`, `IDENTITY_URL` e `Identity__Issuer` para mantener consistencia entre el enrutamiento y las aplicaciones.
 
 ---
 
@@ -195,7 +227,8 @@ kubectl get ingress -n cobroup-dev
 
 1. **Gestión de Manifiestos**:
    Al realizar push a las ramas `dev`, `qa` o `main`/`prod` de este repositorio `cobroup.enviroments`, el workflow de GitHub Actions:
-   - Sustituye los placeholders de conexión (`${{Dev_OperationsDatabase__ConnectionString}}`, etc.) con los secrets de GitHub.
+   - Obtiene secretos y variables del GitHub Environment correspondiente (`dev`, `qa` o `prod`).
+   - Renderiza los hosts del Ingress y las URLs públicas de aplicación desde `INGRESS_FRONTEND_HOST`, `INGRESS_ADMIN_FRONTEND_HOST`, `INGRESS_API_HOST`, `INGRESS_AUTH_HOST` y, solo en Prod, `INGRESS_FRONTEND_ALIAS_HOST`.
    - Copia mediante SCP los manifiestos renderizados al directorio `/opt/cobroup/deploys/<ambiente>` y el bootstrap a `/opt/cobroup/deploys/bootstrap` en la VPS.
 2. **Despliegue de Código**:
    Al realizar push en los repositorios de microservicios (`MS.Cobroup.Backend`, `MS.Cobroup.BackendAdmin`, `MF.cobroup-frontend`, `MF.cobroup-frontend-admin`), su GitHub Action:

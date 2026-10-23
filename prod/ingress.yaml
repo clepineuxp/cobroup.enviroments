@@ -16,15 +16,15 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - cobroup.com
-        - www.cobroup.com
-        - admin.cobroup.com
-        - api.cobroup.com
-        - auth.cobroup.com
+        - __INGRESS_FRONTEND_HOST__
+        - __INGRESS_FRONTEND_ALIAS_HOST__
+        - __INGRESS_ADMIN_FRONTEND_HOST__
+        - __INGRESS_API_HOST__
+        - __INGRESS_AUTH_HOST__
       secretName: cobroup-tls
   rules:
     # 1. PWA Recolector (Collector Frontend)
-    - host: cobroup.com
+    - host: __INGRESS_FRONTEND_HOST__
       http:
         paths:
           - path: /api/operations
@@ -42,7 +42,7 @@ spec:
                 port:
                   number: 8080
 
-    - host: www.cobroup.com
+    - host: __INGRESS_FRONTEND_ALIAS_HOST__
       http:
         paths:
           - path: /api/operations
@@ -61,7 +61,7 @@ spec:
                   number: 8080
 
     # 2. Portal Administrativo (Admin Frontend)
-    - host: admin.cobroup.com
+    - host: __INGRESS_ADMIN_FRONTEND_HOST__
       http:
         paths:
           - path: /api/operations
@@ -80,7 +80,7 @@ spec:
                   number: 8080
 
     # 3. Dedicated Operations API Domain
-    - host: api.cobroup.com
+    - host: __INGRESS_API_HOST__
       http:
         paths:
           - path: /
@@ -92,7 +92,7 @@ spec:
                   number: 8080
 
     # 4. Dedicated Auth / Identity Domain
-    - host: auth.cobroup.com
+    - host: __INGRESS_AUTH_HOST__
       http:
         paths:
           - path: /
@@ -123,12 +123,12 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - cobroup.com
-        - www.cobroup.com
-        - admin.cobroup.com
+        - __INGRESS_FRONTEND_HOST__
+        - __INGRESS_FRONTEND_ALIAS_HOST__
+        - __INGRESS_ADMIN_FRONTEND_HOST__
       secretName: cobroup-tls
   rules:
-    - host: cobroup.com
+    - host: __INGRESS_FRONTEND_HOST__
       http:
         paths:
           - path: /identity(/|$)(.*)
@@ -138,7 +138,7 @@ spec:
                 name: admin-backend
                 port:
                   number: 8080
-    - host: www.cobroup.com
+    - host: __INGRESS_FRONTEND_ALIAS_HOST__
       http:
         paths:
           - path: /identity(/|$)(.*)
@@ -148,7 +148,7 @@ spec:
                 name: admin-backend
                 port:
                   number: 8080
-    - host: admin.cobroup.com
+    - host: __INGRESS_ADMIN_FRONTEND_HOST__
       http:
         paths:
           - path: /identity(/|$)(.*)
