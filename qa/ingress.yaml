@@ -7,7 +7,6 @@ metadata:
     app.kubernetes.io/part-of: cobroup
     environment: qa
   annotations:
-    ingress.class: nginx
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "25m"
@@ -17,14 +16,14 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - qa.cobroup.com
-        - qa-admin.cobroup.com
-        - qa-api.cobroup.com
-        - qa-auth.cobroup.com
+        - __INGRESS_FRONTEND_HOST__
+        - __INGRESS_ADMIN_FRONTEND_HOST__
+        - __INGRESS_API_HOST__
+        - __INGRESS_AUTH_HOST__
       secretName: cobroup-tls
   rules:
     # 1. PWA Recolector (Collector Frontend)
-    - host: qa.cobroup.com
+    - host: __INGRESS_FRONTEND_HOST__
       http:
         paths:
           - path: /api/operations
@@ -32,13 +31,6 @@ spec:
             backend:
               service:
                 name: backend
-                port:
-                  number: 8080
-          - path: /identity
-            pathType: Prefix
-            backend:
-              service:
-                name: admin-backend
                 port:
                   number: 8080
           - path: /
@@ -50,7 +42,7 @@ spec:
                   number: 8080
 
     # 2. Portal Administrativo (Admin Frontend)
-    - host: qa-admin.cobroup.com
+    - host: __INGRESS_ADMIN_FRONTEND_HOST__
       http:
         paths:
           - path: /api/operations
@@ -58,13 +50,6 @@ spec:
             backend:
               service:
                 name: backend
-                port:
-                  number: 8080
-          - path: /identity
-            pathType: Prefix
-            backend:
-              service:
-                name: admin-backend
                 port:
                   number: 8080
           - path: /
@@ -76,7 +61,7 @@ spec:
                   number: 8080
 
     # 3. Dedicated Operations API Domain
-    - host: qa-api.cobroup.com
+    - host: __INGRESS_API_HOST__
       http:
         paths:
           - path: /
@@ -87,12 +72,57 @@ spec:
                 port:
                   number: 8080
 
-    # 4. Dedicated Auth / Identity Domain (OpenIddict)
-    - host: qa-auth.cobroup.com
+    # 4. Dedicated Auth / Identity Domain
+    - host: __INGRESS_AUTH_HOST__
       http:
         paths:
           - path: /
             pathType: Prefix
+            backend:
+              service:
+                name: admin-backend
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cobroup-ingress-identity-rewrite
+  namespace: cobroup-qa
+  labels:
+    app.kubernetes.io/part-of: cobroup
+    environment: qa
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: "25m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - __INGRESS_FRONTEND_HOST__
+        - __INGRESS_ADMIN_FRONTEND_HOST__
+      secretName: cobroup-tls
+  rules:
+    - host: __INGRESS_FRONTEND_HOST__
+      http:
+        paths:
+          - path: /identity(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: admin-backend
+                port:
+                  number: 8080
+    - host: __INGRESS_ADMIN_FRONTEND_HOST__
+      http:
+        paths:
+          - path: /identity(/|$)(.*)
+            pathType: ImplementationSpecific
             backend:
               service:
                 name: admin-backend

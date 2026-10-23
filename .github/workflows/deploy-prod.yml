@@ -1,122 +1,84 @@
-name: Export Production Manifests via SSH
+name: Deploy Prod Manifests via SSH
 
 on:
   push:
     branches:
-      - main
       - prod
     paths:
       - 'prod/**'
       - 'bootstrap/**'
+      - 'scripts/**'
       - '.github/workflows/deploy-prod.yml'
   workflow_dispatch:
 
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
-  export-to-server:
-    name: Export Production Manifests to Remote Server
+  deploy-prod:
+    name: Deploy Prod Manifests to Remote Cluster
     runs-on: ubuntu-latest
-    environment: cobroup
+    environment: prod
+    env:
+      INGRESS_FRONTEND_HOST: ${{ vars.INGRESS_FRONTEND_HOST }}
+      INGRESS_FRONTEND_ALIAS_HOST: ${{ vars.INGRESS_FRONTEND_ALIAS_HOST }}
+      INGRESS_ADMIN_FRONTEND_HOST: ${{ vars.INGRESS_ADMIN_FRONTEND_HOST }}
+      INGRESS_API_HOST: ${{ vars.INGRESS_API_HOST }}
+      INGRESS_AUTH_HOST: ${{ vars.INGRESS_AUTH_HOST }}
 
     steps:
       - name: 1. Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: 2. Set up Python for Variable Substitution
-        uses: actions/setup-python@v5
+      - name: 2. Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
-          python-version: '3.x'
+          python-version: '3.12'
 
-      - name: 3. Replace Environment Placeholders in prod/ Manifests
+      - name: 3. Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r scripts/requirements.txt
+
+      - name: 4. Run Security and Manifest Validation Gates
+        run: |
+          python -m unittest scripts/test_render_manifests.py -v
+          python -m unittest scripts/test_verify_ssh_host.py -v
+
+      - name: 5. Render and Validate Prod Manifests (Non-Sensitive)
         env:
-          PROD_OPERATIONSDATABASE_CONNECTIONSTRING: ${{ vars.PROD_OPERATIONSDATABASE_CONNECTIONSTRING || secrets.PROD_OPERATIONSDATABASE_CONNECTIONSTRING }}
-          PROD_IDENTITYDATABASE_CONNECTIONSTRING: ${{ vars.PROD_IDENTITYDATABASE_CONNECTIONSTRING || secrets.PROD_IDENTITYDATABASE_CONNECTIONSTRING }}
-          PROD_JWT_SECRET: ${{ vars.PROD_JWT_SECRET || secrets.PROD_JWT_SECRET }}
+          OPERATIONS_DATABASE_CONNECTIONSTRING: ${{ secrets.OPERATIONS_DATABASE_CONNECTIONSTRING }}
+          IDENTITY_DATABASE_CONNECTIONSTRING: ${{ secrets.IDENTITY_DATABASE_CONNECTIONSTRING }}
+          JWT_ACTIVE_SIGNING_KEY_BASE64: ${{ secrets.JWT_ACTIVE_SIGNING_KEY_BASE64 }}
+          JWT_PREVIOUS_SIGNING_KEY_BASE64: ${{ secrets.JWT_PREVIOUS_SIGNING_KEY_BASE64 }}
+          JWT_ACTIVE_KEY_ID: ${{ vars.JWT_ACTIVE_KEY_ID }}
+          JWT_PREVIOUS_KEY_ID: ${{ vars.JWT_PREVIOUS_KEY_ID }}
+          JWT_KEY_FINGERPRINTS_JSON: ${{ vars.JWT_KEY_FINGERPRINTS_JSON }}
           GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE || 'cobroup-prod' }}
+          PVC_STORAGE_CLASS: ${{ vars.PVC_STORAGE_CLASS }}
         run: |
-          python3 - << 'EOF'
-          import os, base64
+          python scripts/render_manifests.py --env prod
 
-          P = "${" + "{"
-          S = "}}"
-
-          replacements = {
-              f"{P}Prod_OperationsDatabase__ConnectionString{S}": os.environ.get("PROD_OPERATIONSDATABASE_CONNECTIONSTRING", ""),
-              f"{P}Prod_IdentityDatabase__ConnectionString{S}": os.environ.get("PROD_IDENTITYDATABASE_CONNECTIONSTRING", ""),
-              f"{P}Prod_Jwt__Secret{S}": os.environ.get("PROD_JWT_SECRET", ""),
-          }
-
-          # Scan all yaml/yml files in prod directory
-          for root, dirs, files in os.walk("prod"):
-              for file in files:
-                  if file.endswith((".yaml", ".yml")):
-                      filepath = os.path.join(root, file)
-                      with open(filepath, "r", encoding="utf-8") as f:
-                          content = f.read()
-
-                      modified = content
-                      for placeholder, value in replacements.items():
-                          if value and placeholder in modified:
-                              modified = modified.replace(placeholder, value)
-                              print(f"Replaced {placeholder} in {filepath}")
-
-                      # Also substitute ghcr credentials if available
-                      ghcr_user = os.environ.get("GHCR_USERNAME")
-                      ghcr_token = os.environ.get("GHCR_TOKEN")
-                      if ghcr_user and ghcr_token and file == "ghcr-secret.yaml":
-                          auth_b64 = base64.b64encode(f"{ghcr_user}:{ghcr_token}".encode("utf-8")).decode("utf-8")
-                          modified = modified.replace("CHANGE_ME_GITHUB_USER", ghcr_user)
-                          modified = modified.replace("CHANGE_ME_GITHUB_PAT", ghcr_token)
-                          modified = modified.replace("CHANGE_ME", auth_b64)
-                          print(f"Injected GHCR credentials in {filepath}")
-
-                      if modified != content:
-                          with open(filepath, "w", encoding="utf-8") as f:
-                              f.write(modified)
-          EOF
-
-      - name: 4. Ensure Target Directories on Remote Server
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          script: |
-            mkdir -p /opt/cobroup/deploys/prod
-            mkdir -p /opt/cobroup/deploys/bootstrap
-
-      - name: 5. Copy Production Manifests to /opt/cobroup/deploys/prod via SCP
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          source: "prod/*"
-          target: "/opt/cobroup/deploys/prod"
-          strip_components: 1
-          overwrite: true
-
-      - name: 6. Copy Bootstrap Manifests to /opt/cobroup/deploys/bootstrap via SCP
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          source: "bootstrap/*"
-          target: "/opt/cobroup/deploys/bootstrap"
-          strip_components: 1
-          overwrite: true
-
-      - name: 7. Verify Files on Remote Server
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          port: ${{ secrets.SSH_PORT || 22 }}
-          script: |
-            echo "Manifests successfully exported to /opt/cobroup/deploys/prod:"
-            ls -la /opt/cobroup/deploys/prod
+      - name: 6. Deploy Prod Remotely with Strict SSH Pinning & Safe Rollout
+        env:
+          ENV: prod
+          OPERATIONS_DATABASE_CONNECTIONSTRING: ${{ secrets.OPERATIONS_DATABASE_CONNECTIONSTRING }}
+          IDENTITY_DATABASE_CONNECTIONSTRING: ${{ secrets.IDENTITY_DATABASE_CONNECTIONSTRING }}
+          JWT_ACTIVE_SIGNING_KEY_BASE64: ${{ secrets.JWT_ACTIVE_SIGNING_KEY_BASE64 }}
+          JWT_PREVIOUS_SIGNING_KEY_BASE64: ${{ secrets.JWT_PREVIOUS_SIGNING_KEY_BASE64 }}
+          JWT_ACTIVE_KEY_ID: ${{ vars.JWT_ACTIVE_KEY_ID }}
+          JWT_PREVIOUS_KEY_ID: ${{ vars.JWT_PREVIOUS_KEY_ID }}
+          JWT_KEY_FINGERPRINTS_JSON: ${{ vars.JWT_KEY_FINGERPRINTS_JSON }}
+          GHCR_USERNAME: ${{ vars.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          KUBERNETES_NAMESPACE: ${{ vars.KUBERNETES_NAMESPACE || 'cobroup-prod' }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          SSH_HOST_ED25519_FINGERPRINT: ${{ vars.SSH_HOST_ED25519_FINGERPRINT }}
+        run: |
+          bash scripts/deploy_remote.sh

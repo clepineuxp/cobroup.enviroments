@@ -8,8 +8,8 @@ metadata:
     app.kubernetes.io/part-of: cobroup
     environment: qa
 data:
-  API_URL: "https://qa-api.cobroup.com"
-  IDENTITY_URL: "https://qa-auth.cobroup.com"
+  API_URL: "https://__INGRESS_API_HOST__"
+  IDENTITY_URL: "https://__INGRESS_AUTH_HOST__"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -52,8 +52,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: admin-frontend-config
-            - secretRef:
-                name: admin-frontend-secret
           resources:
             requests:
               cpu: 50m

@@ -5,15 +5,10 @@ namespace: cobroup-dev
 
 resources:
   - backend/backend-manifest.yaml
-  - backend/secret.yaml
   - admin-backend/admin-backend-manifest.yaml
-  - admin-backend/secret.yaml
   - frontend/frontend-manifest.yaml
-  - frontend/secret.yaml
   - admin-frontend/admin-frontend-manifest.yaml
-  - admin-frontend/secret.yaml
   - ingress.yaml
-  - ghcr-secret.yaml
 
 labels:
   - pairs:
